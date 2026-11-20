@@ -6,6 +6,8 @@ _src = open(os.path.join(HERE, "test_scanner.py")).read()
 exec(_src.split("# 1. Market-wide default")[0])                     # fixtures + mocked SEC
 _h = _src.split("HIST = 424242", 1)[1].split("CALLS.clear()")[0]   # history fixtures (company HIST)
 exec("HIST = 424242" + _h)
+_g = _src.split("SIG = 777001", 1)[1].split("F.Cache.clear_all()")[0]   # v1.3 fixtures (company SIGL)
+exec("SIG = 777001" + _g)
 import tkinter as tk
 import webbrowser
 opened = []
@@ -25,20 +27,29 @@ def mainloop(self, n=0):
         app.apply_preset()
         print("PRESET:", app.status_var.get())
         app.min_var.set("0"); app.code_vars["S"].set(True)
-        app.tickers_var.set("HIST, NVDA, MSFT, AAPL")
+        app.tickers_var.set("SIGL, HIST, NVDA, MSFT, AAPL")
         app.cluster_only_var.set(False); app.min_stake_var.set("0"); app.excl_plan_var.set(False)
         app.hide_routine_var.set(False); app.hide_sold_var.set(False)
         self.state("normal"); self.geometry("1900x950+0+0")
         app._view_changed()
         app.start_scan()
-        self.after(14000, lambda: step2(app))
+        self.after(18000, lambda: step2(app))
     def step2(app):
-        app.sort_by("pattern")
+        app.sort_by("score"); app.sort_by("score") if not app.sort_desc else None
         self.update(); shot("1_all_rows")
+        print("SCORES:", [(app.rows[i]["ticker"], app.rows[i]["insider"][:14], app.rows[i].get("score")) for i in app.tree.get_children()])
+        app.tree.selection_set(app.tree.get_children()[0])
+        r0 = app.rows[app.tree.get_children()[0]]
+        print("WHY TOP:", r0["score"], r0["score_why"][:4])
+        tr = None
+        import gc as _gc
+        app.show_track_record()
+        self.after(2500, lambda: (self.update(), shot("4_track_record"),
+                                  print("TRACK:", [w for w in _gc.get_objects() if type(w).__name__ == "TrackRecordWindow"][0].summary.get())))
         print("PATTERNS:", sorted((r["insider"], r["pattern"], r["sold"]) for r in app.rows.values() if r["code"] == "P"))
         print("ALL:", app.summary_var.get())
         app.hide_routine_var.set(True); app.hide_sold_var.set(True); app._view_changed()
-        self.after(400, lambda: step2b(app))
+        self.after(3500, lambda: step2b(app))
     def step2b(app):
         self.update(); shot("1b_hide_routine_sold")
         print("HIDE ROUTINE+SOLD:", sorted(app.rows[i]["insider"] for i in app.tree.get_children()))

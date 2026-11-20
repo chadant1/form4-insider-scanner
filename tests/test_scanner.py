@@ -86,6 +86,7 @@ def form4(acc, cik, name, ticker, owners, txns, filed, schema="X0508", fn="wk-fo
     <footnote id="F1">Weighted average price.</footnote>
     <footnote id="F2">The sales reported were effected pursuant to a Rule 10b5-1 trading plan adopted by the reporting person on May 1, 2026.</footnote>
     <footnote id="F3">These shares were not purchased pursuant to a Rule 10b5-1 trading plan.</footnote>
+    <footnote id="F4">Purchased in the Issuer's underwritten public offering at the public offering price.</footnote>
   </footnotes>
 </ownershipDocument>"""
     return f"""<SEC-DOCUMENT>{acc}.txt : {filed:%Y%m%d}
@@ -368,10 +369,10 @@ check("UA validation", F.valid_user_agent("Jane Doe jane@ex.com") and not F.vali
 # 8. New signal features
 rows, _ = run(P(codes={"P", "S"}, min_value=0))
 by = {(r["ticker"], r["insider"]): r for r in rows}
-print("\n[8] clusters:", {k: v for k, v in CLUSTERS.items() if not k.endswith("|A")})
-check("NVDA buy cluster: 3 insiders, 2 discretionary", CLUSTERS.get("1045810|P") == (3, 2))
-check("MSFT cluster = 2 (Hood + Smith)", CLUSTERS.get("789019|P") == (2, 2))
-check("single-insider issuer cluster = 1", CLUSTERS.get("797468|P") == (1, 1))
+print("\n[8] clusters:", {k: v[:2] for k, v in CLUSTERS.items() if not k.endswith("|A")})
+check("NVDA buy cluster: 3 insiders, 2 discretionary", CLUSTERS.get("1045810|P")[:2] == (3, 2))
+check("MSFT cluster = 2 (Hood + Smith)", CLUSTERS.get("789019|P")[:2] == (2, 2))
+check("single-insider issuer cluster = 1", CLUSTERS.get("797468|P")[:2] == (1, 1))
 check("stake: NVDA +50%", abs(by[("NVDA", "Director Jane")]["stake"] - 50.0) < 1e-9)
 check("stake: TBIO new position", by[("TBIO", "Big Fund LP; Big Fund GP LLC")]["stake"] == float("inf"))
 check("stake: MSFT +10%", abs(by[("MSFT", "Hood Amy")]["stake"] - 10.0) < 1e-9)
@@ -397,7 +398,9 @@ check("min stake 20% (Other Director +12.5%, MSFT/FRSH +10%, OXY +0.4% dropped)"
 out = F.apply_signal_filters([dict(r) for r in rows], CLUSTERS, True, 0, 0)
 check("exclude plan drops AAPL sale + planned buy", not any(r["plan"] for r in out) and len(out) == len(rows) - 2)
 csvrow = F.row_to_csv(by[("TBIO", "Big Fund LP; Big Fund GP LLC")])
-check("CSV has stake/cluster/plan", csvrow[11] == "New position" and csvrow[14] == "No" and len(csvrow) == len(F.CSV_HEADERS))
+H = F.CSV_HEADERS.index
+check("CSV has stake/cluster/plan", csvrow[H("Stake Change %")] == "New position" and csvrow[H("10b5-1 Plan")] == "No"
+      and len(csvrow) == len(F.CSV_HEADERS))
 
 # 9. Insider history: buying pattern + later sales (ticker mode, company HIST)
 HIST = 424242
@@ -520,7 +523,177 @@ check("later sale before buy date ignored", F.classify_later_sales(
 check("sale without holdings -> share count", F.classify_later_sales(
     d0, [{"txns": [{"t": "N", "code": "S", "sh": 100, "date": "2026-11-12"}]}], None)[1] == "Sold 100 sh (Nov 12)")
 
-# 10. Cancel
+# 10. v1.3: offering / fund flags, company data, prices, Signal Score, track record
+SIG = 777001
+S_FIL = {}
+F4N = '<footnoteId id="F4"/>'
+CEO_A = {"name": "Able Alice", "off": "1", "title": "Chief Executive Officer", "cik": "6001"}
+FUND_B = {"name": "Alpha Capital Partners LP", "ten": "1", "cik": "6002"}
+DIR_C = {"name": "Offering Oscar", "dir": "1", "cik": "6003"}
+SELL_D = {"name": "Seller Sam", "off": "1", "title": "President", "cik": "6004"}
+_k = [0]
+
+
+def sacc():
+    _k[0] += 1
+    return f"{SIG:010d}-26-{_k[0]:06d}"
+
+
+def add_sig(owner, txns, d):
+    a = sacc()
+    S_FIL[a] = (owner, txns, d)
+    return a
+
+
+A_ACC = add_sig(CEO_A, [("P", 20000, 15.0, "A", 30000)], D2)
+B_ACC = add_sig(FUND_B, [("P", 10000, 15.0, "A", 1010000)], D2)
+C_ACC = add_sig(DIR_C, [("P", 50000, 12.0, "A", 60000, F4N)], D2)
+D_ACC = add_sig(SELL_D, [("S", 300000, 20.0, "D", 100000)], TODAY - dt.timedelta(days=60))
+for a, (owner, txns, d) in S_FIL.items():
+    RESP[f"{F.SEC_WWW}/Archives/edgar/data/{SIG}/{a}.txt"] = form4(a, SIG, "Signal Corp", "SIGL", [owner], txns, d)
+
+
+def sig_subs(accs, extra=()):
+    accs = sorted(accs, key=lambda a: S_FIL[a][2], reverse=True)
+    acc_list = accs + [e[2] for e in extra]
+    return json.dumps({"filings": {"recent": {
+        "accessionNumber": acc_list,
+        "filingDate": [str(S_FIL[a][2]) for a in accs] + [e[0] for e in extra],
+        "form": ["4"] * len(accs) + [e[1] for e in extra],
+        "primaryDocument": ["x.xml"] * len(acc_list)}, "files": []}}).encode()
+
+
+D13 = (str(TODAY - dt.timedelta(days=20)), "SCHEDULE 13D", "0009999999-26-000001")
+OLD13 = (str(TODAY - dt.timedelta(days=200)), "SC 13D", "0009999999-25-000002")
+RESP[f"{F.SEC_DATA}/submissions/CIK{SIG:010d}.json"] = sig_subs(list(S_FIL), extra=[D13, OLD13])
+for o in (CEO_A, FUND_B, DIR_C, SELL_D):
+    RESP[f"{F.SEC_DATA}/submissions/CIK{int(o['cik']):010d}.json"] = sig_subs([a for a, v in S_FIL.items() if v[0] is o])
+RESP[f"{F.SEC_DATA}/api/xbrl/companyconcept/CIK{SIG:010d}/dei/EntityCommonStockSharesOutstanding.json"] = json.dumps(
+    {"units": {"shares": [{"end": "2025-06-30", "val": 9000000, "filed": "2025-08-01"},
+                          {"end": "2026-06-30", "val": 10000000, "filed": "2026-08-01"}]}}).encode()
+
+
+def yahoo_json(points):
+    ts = [int(dt.datetime(d.year, d.month, d.day, 14, 30, tzinfo=dt.timezone.utc).timestamp()) for d, _ in points]
+    closes = [c for _, c in points]
+    return json.dumps({"chart": {"result": [{"meta": {"gmtoffset": -18000, "symbol": "SIGL"}, "timestamp": ts,
+                       "indicators": {"quote": [{"close": closes}], "adjclose": [{"adjclose": closes}]}}],
+                       "error": None}}).encode()
+
+
+pts, d = [], TODAY - dt.timedelta(days=700)
+while d <= TODAY:
+    if d.weekday() < 5:
+        age = (D2 - d).days
+        if d > D2:
+            px = 18.0                                   # after the buy: 18
+        elif age <= 60:
+            px = 15.0                                   # 2 months before the buy: fell to 15
+        elif age <= 240:
+            px = 30.0                                   # high of 30 within the past year
+        else:
+            px = 20.0
+        pts.append((d, px))
+    d += dt.timedelta(days=1)
+pts[-3] = (pts[-3][0], None)                            # a null bar must be skipped
+RESP["https://query1.finance.yahoo.com/v8/finance/chart/SIGL?range=2y&interval=1d&includeAdjustedClose=true"] = yahoo_json(pts)
+tick = json.loads(RESP[f"{F.SEC_WWW}/files/company_tickers.json"])
+tick["10"] = {"cik_str": SIG, "ticker": "SIGL", "title": "Signal Corp"}
+RESP[f"{F.SEC_WWW}/files/company_tickers.json"] = json.dumps(tick).encode()
+F.Cache.clear_all()
+
+q = queue.Queue()
+F.Scanner(P(tickers=["SIGL"], codes={"P", "S"}, min_value=0), q, threading.Event()).run()
+srows, extra, sclusters, kinds = [], {}, {}, []
+while not q.empty():
+    _, kind, payload = q.get()
+    kinds.append(kind)
+    if kind == "rows":
+        srows.extend(payload)
+    elif kind in ("history", "context"):
+        for acc, info in payload.items():
+            extra.setdefault(acc, {}).update(info)
+    elif kind == "clusters":
+        sclusters.update(payload)
+for r in srows:
+    r.update(extra.get(r["acc"], {}))
+F.apply_signal_filters(srows, sclusters, False, 0, 0)
+sb = {r["insider"]: r for r in srows if r["code"] == "P"}
+A, B, C = sb["Able Alice"], sb["Alpha Capital Partners LP"], sb["Offering Oscar"]
+print("\n[10] v1.3:")
+for r in (A, B, C):
+    print(f"   {r['insider']:<26} score={r['score']:<3} flags={'offer ' if r['offering'] else ''}{'fund' if r['entity'] else ''}"
+          f" pct_co={r.get('cluster_pct_co')} mcap={r.get('mcap')} off_high={r.get('off_high')} since={r.get('since')}")
+print("   " + "\n   ".join(A["score_why"]))
+check("context posted before done", "context" in kinds and kinds.index("context") < kinds.index("done"))
+check("offering footnote flagged", C["offering"] and not A["offering"] and not B["offering"])
+check("fund buyer flagged", B["entity"] and not A["entity"] and not C["entity"])
+check("shares outstanding = latest filing", A["shares_out"] == 10_000_000)
+check("this buy % of company", abs(A["pct_co"] - 0.2) < 1e-9)
+check("discretionary cluster excludes offering buy", sclusters[f"{SIG}|P"][:2] == (3, 2))
+check("cluster % of company (all 3 buys)", abs(A["cluster_pct_co"] - 0.8) < 1e-9)
+check("market cap = shares x last close", abs(A["mcap"] - 180_000_000) < 1)
+check("50% off 52-week high at buy", abs(A["off_high"] - (-50.0)) < 1e-6)
+check("3-month change before buy", A["chg3m"] is not None and abs(A["chg3m"] - (-50.0)) < 1e-6)
+check("+20% since insider's price", abs(A["since"] - 20.0) < 1e-6)
+check("offering buyer since-buy uses own price ($12 -> $18 = +50%)", abs(C["since"] - 50.0) < 1e-6)
+check("net insider flow 90d", A["net90"]["sell"] == 6_000_000 and A["net90"]["buyers"] == 3 and A["net90"]["sellers"] == 1)
+check("13D in last 90 days (old one ignored)", A["d13"] == 1 and A["d13_last"] == D13[0])
+check("Yahoo + XBRL requested", any("finance.yahoo.com" in u for u in CALLS) and any("companyconcept" in u for u in CALLS))
+check("score: CEO buy ranks above fund and offering buys", A["score"] > B["score"] and A["score"] > C["score"])
+check("score reasons mention CEO, 13D, heavy sellers",
+      any("CEO" in w for w in A["score_why"]) and any("13D" in w for w in A["score_why"])
+      and any("net sellers" in w for w in A["score_why"]))
+check("score penalises offering", any("offering" in w for w in C["score_why"]))
+check("offering buy capped at 30", C["score"] <= 30 and any(w.startswith("capped at 30") for w in C["score_why"]))
+
+out = F.apply_signal_filters([dict(r) for r in srows if r["code"] == "P"], sclusters, False, 0, 0,
+                             exclude_offering=True, exclude_entity=True)
+check("exclude offering + funds", [r["insider"] for r in out] == ["Able Alice"])
+out = F.apply_signal_filters([dict(r) for r in srows if r["code"] == "P"], sclusters, False, 0, 0, min_score=A["score"])
+check("min score filter", [r["insider"] for r in out] == ["Able Alice"])
+csvrow = F.row_to_csv(A)
+check("CSV has score / mcap / 13D / reasons", csvrow[H("Signal Score")] == A["score"] and csvrow[H("13D Filings 90d")] == 1
+      and "CEO" in csvrow[H("Score Reasons")] and len(csvrow) == len(F.CSV_HEADERS))
+
+# unit checks
+check("yahoo symbols", (F.yahoo_symbol("BRK.B"), F.yahoo_symbol("none"), F.yahoo_symbol("")) == ("BRK-B", None, None))
+check("two share classes summed", F.latest_shares_outstanding({"units": {"shares": [
+    {"end": "2026-06-30", "val": 100, "filed": "2026-08-01"}, {"end": "2026-06-30", "val": 40, "filed": "2026-08-01"},
+    {"end": "2025-06-30", "val": 999, "filed": "2025-08-01"}]}}) == 140)
+check("no shares data", F.latest_shares_outstanding({}) is None)
+split = [("2026-01-02", 100.0, 50.0), ("2026-03-02", 60.0, 60.0)]          # 2:1 split after the buy
+check("since-buy is split-safe", abs(F.price_metrics(split, dt.date(2026, 1, 2), 100.0)["since_buy"] - 20.0) < 1e-9)
+check("bad Yahoo JSON -> None", F.parse_yahoo_chart(b"<html>") is None and F.parse_yahoo_chart(b'{"chart":{"result":[]}}') is None)
+xml = (b'<ownershipDocument><schemaVersion>X0508</schemaVersion><issuer><issuerCik>1</issuerCik></issuer>'
+       b'<reportingOwner><reportingOwnerId><rptOwnerCik>2</rptOwnerCik><rptOwnerName>X Y</rptOwnerName></reportingOwnerId>'
+       b'</reportingOwner><remarks>Shares were acquired in a private placement.</remarks></ownershipDocument>')
+check("remarks mark whole filing as offering", F.parse_ownership_xml(xml, {"acc": "x"})["offering_doc"] is True)
+base = {"code": "P", "cluster": 1, "value": 50_000}
+check("plain buy scores 40", F.signal_score(base)[0] == 40)
+check("routine buy capped at 45", F.signal_score({**base, "cluster": 4, "roles_all": [F.ROLE_CEO], "value": 2e6,
+                                                   "pattern_kind": "routine"})[0] == 45)
+check("sells have no score", F.signal_score({"code": "S"})[0] is None)
+check("score clamps 0..100", F.signal_score({**base, "offering": True, "plan": True, "pattern_kind": "routine",
+                                              "sold_kind": "sold", "entity": True})[0] == 0
+      and F.signal_score({**base, "cluster": 5, "roles_all": [F.ROLE_CEO], "value": 2e6, "stake": float("inf"),
+                          "pattern_kind": "first", "cluster_pct_co": 2, "mcap": 1e8, "off_high": -60, "d13": 1})[0] == 100)
+import tempfile as _tf
+log = F.SignalLog(os.path.join(_tf.mkdtemp(), "t.sqlite3"))
+n1 = log.log([dict(A, trade_start=str(D2)), dict(C, trade_start=str(D2)), {"code": "S", "acc": "z"}])
+n2 = log.log([dict(A, score=1)])
+items = log.all()
+check("track record logs buys once (first score kept)", n1 == 2 and n2 == 0 and
+      next(i for i in items if i["acc"] == A["acc"])["score"] == A["score"])
+summ = F.track_record_summary([{"score": 80, "ret": 10.0, "excess": 4.0}, {"score": 75, "ret": -2.0, "excess": -5.0},
+                               {"score": 40, "ret": 3.0, "excess": None}])
+check("track record summary by band", summ["70+"]["n"] == 2 and abs(summ["70+"]["avg"] - 4.0) < 1e-9
+      and summ["70+"]["beat"] == 50.0 and summ["50-69"] is None and summ["under 50"]["avg_excess"] is None)
+log.clear()
+check("track record clear", log.all() == [])
+log.close()
+
+# 11. Cancel
 q = queue.Queue(); ev = threading.Event(); ev.set()
 F.Scanner(P(), q, ev).run()
 kinds = [k for _, k, _ in list(q.queue)]
