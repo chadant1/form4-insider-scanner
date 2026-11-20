@@ -31,6 +31,8 @@ Click **★ True Insider Buying preset**, then **Start Scan**. The preset sets:
 | Hide buyers who have sold since | On | A quick sale undercuts the signal |
 | Exclude offering / private-placement buys | On | Buying in a company offering isn't an open-market bet |
 | Exclude funds / companies as buyers | On | A fund's 10% stake is an investment bet, not inside knowledge |
+| Hide duplicate filings | On | A fund and its GP (or a person and their trust) reporting the same purchase count once |
+| Min price / min $ volume | $1 / $100K a day | Avoids penny stocks and shares you couldn't realistically trade |
 
 Results are sorted by **Signal Score**, with the best first. The **Signal Filters** apply instantly to results you already have, so you can loosen or tighten them without re-scanning.
 
@@ -52,8 +54,26 @@ Every open-market buy gets a score. It starts at 40, then adds or subtracts poin
 | Schedule 13D (5%+ activist stake) filed in last 90 days | +5 |
 | Already up 30%+ since the purchase | −6 |
 | Has sold since / 10b5-1 plan / offering buy / fund buyer | −10 to −25 / −15 / −25 / −15 |
+| This insider's past buys beat / lagged SPY by 10%+ over 6 months (2+ buys) | +6 / −4 |
+| Bought within 30 days of an earnings report that dropped the stock 10%+ | +4 |
+| Book/market 0.5+ / trading below book | +2 / +4 |
+| Burning cash with under a year left / negative equity | −5 / −3 |
+| Form 4 filed 10+ business days late / thinly traded (under $250K a day) | −4 / −5 |
 
-Disqualifiers also **cap** the score: an offering buy is capped at 30, a 10b5-1 or routine buy at 45, and a buyer who has since sold 25%+ at 40. Right-click a row and choose **Why this score?** to see every point. The weights are a starting point based on published research and common practice, not a back-tested model. Use the Track Record to see how they hold up.
+Disqualifiers also **cap** the score: an offering buy is capped at 30, a 10b5-1 or routine buy at 45, a buyer who has since sold 25%+ at 40, and a duplicate filing at 20. Right-click a row and choose **Why this score?** to see every point. The default weights are a starting point based on published research and common practice. **Back-test** them on real history (below) and apply tuned weights if they hold up.
+
+### Back-test (File → Back-test Signal Score, Ctrl+B)
+The back-test replays SEC's quarterly **Insider Transactions Data Sets**, the official bulk files of every Form 3/4/5 since 2006, for the quarters you choose. It works like this:
+* Every qualifying buy is scored **as of its filing date**, using only information that was public then. A second buyer counts toward a cluster only once their Form 4 had been filed. Pattern, insider record, net flow, earnings and company data all come from the past.
+* It measures the **1-, 3- and 6-month returns** from the filing date, and the same for SPY.
+* It shows results by **score band**, then by **factor**: the average 6-month return vs SPY with and without each factor, and the points that difference suggests.
+* **Train / test check:** suggested weights are tuned on the first half of the period, then both the current and suggested weights are scored on the second half. Apply them only if they also ranked the second half better. A factor needs 30+ signals each way before any change is suggested. **Reset to default weights** at any time.
+* Company size, book value and cash come from SEC XBRL *frames*, which return one figure for every company in a single request. They use figures from two quarters before each filing, so they had already been published. Prices come from Yahoo.
+* **Caveats:**
+  * Yahoo has no prices for delisted companies, so failed companies drop out (survivorship bias).
+  * Factor comparisons are simple one-at-a-time differences.
+  * The sample is random when there are more signals than the "Max signals" setting.
+  * Downloads are kept in `%LOCALAPPDATA%\Form4Scanner\bulk`.
 
 ### Signal Track Record
 *File → Signal Track Record* (Ctrl+T) lists every scored buy from your completed scans, each logged once with its score at the time. It shows the return from the insider's purchase price to today and **SPY over the same dates**, with a summary by score band: average return, average vs SPY, and % beating SPY. Clearing the download cache doesn't delete this history.
@@ -77,6 +97,10 @@ Disqualifiers also **cap** the score: an offering buy is capped at 30, a 10b5-1 
 * **Sold Since** shows open-market sales (Code S) by the same insider in the same company on or after the purchase date, as a % of what they held right after buying. Shares withheld for taxes when stock vests (Code F) are labelled *tax w/h only* and are not counted as a sale. Rows where the buyer has since sold are shown in **orange**, and routine or regular buyers in grey. Later sales only appear once filed, so re-scan later to refresh.
 * **% of Co.** shows the shares the whole cluster bought as a % of shares outstanding, from SEC XBRL data. **Mkt Cap** = shares outstanding × latest close.
 * **Off 52w Hi** is how far below its 52-week high the stock was on the purchase date. **3M Before** is the 3-month move before the buy (hidden by default). **Since Buy** is the change from the insider's price to the latest close, adjusted for splits and dividends.
+* **Insider Record** shows how this insider's own earlier buys of the stock did over the following 6 months vs SPY: the average, and how many past buys were measured.
+* **Since Earnings** shows the days since the company's last earnings release (8-K Item 2.02) and the stock's move on that report.
+* **Book/Mkt** is shareholders' equity ÷ market value. **Avg $ Vol** is the average daily dollar volume over the 20 sessions before the buy (hidden by default).
+* More **Flags**: *Dup* (same purchase already reported by a related owner), *Late Nd* (filed N business days after the 2-day deadline), *LowCash* (burning cash with under a year left), *NegEq* (negative equity).
 * **Insiders 90d** shows open-market buying minus selling by *all* of the company's insiders over the last 90 days (B = buyers, S = sellers).
 * Prices come from Yahoo Finance's public chart data (no key needed). If Yahoo is unavailable, the price columns stay blank and the score simply leaves those points out.
 * **Deep check buyers** runs after the main scan, for buy rows only. It covers Pattern, Sold Since, company data and prices. It adds a few minutes the first time and is cached afterwards. Untick it for a fast scan.
@@ -95,6 +119,7 @@ This is a research filter, not investment advice. Insider buying has historicall
 Requires Python 3.9+ and nothing else (standard library only).
 ```
 python form4_scanner.py                 # GUI
+python form4_scanner.py --backtest 2025Q2 2026Q1 --ua "Jane Doe jane@example.com" --csv backtest.csv
 python form4_scanner.py --cli --ua "Jane Doe jane@example.com" --days 30 --codes P --min 100000 --exclude-plan --clusters 2 --min-stake 10 --hide-routine --hide-sold --exclude-offering --exclude-funds --min-score 60 --csv out.csv
 python tests/test_scanner.py            # offline tests (mocked SEC responses)
 ```
