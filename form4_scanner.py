@@ -1,0 +1,1800 @@
+#!/usr/bin/env python3
+"""
+SEC Form 4 Insider Trading Scanner
+==================================
+
+A standalone desktop app (Tkinter) that scans SEC EDGAR Form 4 filings for
+insider purchases/sales, filters them by date range, ticker, insider role,
+transaction code and dollar value, and shows the matches in a sortable table.
+
+* Pure Python standard library - no pip installs required (Python 3.9+).
+* All SEC traffic runs on a background thread; the window never freezes.
+* Polite to SEC: declared User-Agent, <= 8 requests/second, retry with backoff.
+* Parsed filings are cached locally, so re-scanning with different filters is fast.
+
+Run:   python form4_scanner.py            (GUI)
+       python form4_scanner.py --cli -h   (command-line mode, for scripting)
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import gzip
+import json
+import os
+import queue
+import re
+import sqlite3
+import sys
+import threading
+import time
+import traceback
+import urllib.error
+import urllib.request
+import webbrowser
+import xml.etree.ElementTree as ET
+import zlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+
+APP_NAME = "SEC Form 4 Insider Scanner"
+APP_VERSION = "1.1.0"
+
+SEC_WWW = "https://www.sec.gov"
+SEC_DATA = "https://data.sec.gov"
+MAX_REQUESTS_PER_SECOND = 8          # SEC's published limit is 10/sec
+FETCH_WORKERS = 4
+CACHE_VERSION = 2                    # bump if the parsed-record format changes
+
+# ----------------------------------------------------------------------------
+# Insider-role matching (case-insensitive, on officer title + relationship text)
+# ----------------------------------------------------------------------------
+ROLE_CEO = "CEO"
+ROLE_CFO = "CFO"
+ROLE_LEGAL = "Legal / General Counsel"
+ROLE_DIR = "Director / 10% Owner"
+ROLE_ORDER = [ROLE_CEO, ROLE_CFO, ROLE_LEGAL, ROLE_DIR]
+
+ROLE_PATTERNS = {
+    ROLE_CEO: re.compile(r"\bC\.?\s?E\.?\s?O\b|chief\s+exec(?:utive|\.)?\s+officer", re.I),
+    ROLE_CFO: re.compile(r"\bC\.?\s?F\.?\s?O\b|chief\s+financial\s+officer", re.I),
+    ROLE_LEGAL: re.compile(r"general\s+counsel|chief\s+legal\s+officer|\bCLO\b|counsel|legal", re.I),
+    ROLE_DIR: re.compile(r"^\s*(?:board\s+)?director\s*$|10\s*%\s*owner|ten\s+percent\s+owner", re.I),
+}
+
+# Transaction codes offered in the UI
+TXN_CODES = {
+    "P": ("Open-Market Purchases (Code P)", "Buy"),
+    "S": ("Open-Market Sales (Code S)", "Sell"),
+    "A": ("Grants / Awards (Code A)", "Grant"),
+    "M": ("Option Exercises (Code M)", "Exercise"),
+}
+
+RANGE_CHOICES = {"Last 7 Days": 7, "Last 14 Days": 14, "Last 30 Days": 30, "Custom Range": None}
+
+
+# ----------------------------------------------------------------------------
+# Paths / settings
+# ----------------------------------------------------------------------------
+def app_data_dir() -> str:
+    base = (os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+            or os.path.join(os.path.expanduser("~"), ".local", "share"))
+    path = os.path.join(base, "Form4Scanner")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def cache_path() -> str:
+    return os.path.join(app_data_dir(), "cache.sqlite3")
+
+
+def settings_path() -> str:
+    return os.path.join(app_data_dir(), "settings.json")
+
+
+def load_settings() -> dict:
+    try:
+        with open(settings_path(), "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def save_settings(data: dict) -> None:
+    try:
+        with open(settings_path(), "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------------------
+# Errors
+# ----------------------------------------------------------------------------
+class Cancelled(Exception):
+    pass
+
+
+class NotFound(Exception):
+    pass
+
+
+class SecAccessDenied(Exception):
+    pass
+
+
+# ----------------------------------------------------------------------------
+# HTTP client with rate limiting, gzip and retry
+# ----------------------------------------------------------------------------
+class SecClient:
+    def __init__(self, user_agent: str, cancel_event: threading.Event,
+                 rps: float = MAX_REQUESTS_PER_SECOND):
+        self.user_agent = user_agent.strip()
+        self.cancel = cancel_event
+        self._interval = 1.0 / rps
+        self._lock = threading.Lock()
+        self._next_slot = 0.0
+        self.request_count = 0
+
+    def _sleep(self, seconds: float) -> None:
+        if seconds > 0 and self.cancel.wait(seconds):
+            raise Cancelled()
+        if self.cancel.is_set():
+            raise Cancelled()
+
+    def _throttle(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next_slot)
+            self._next_slot = slot + self._interval
+        self._sleep(slot - now)
+
+    @staticmethod
+    def _decode(data: bytes, encoding: str) -> bytes:
+        encoding = (encoding or "").lower()
+        if encoding == "gzip" or data[:2] == b"\x1f\x8b":
+            return gzip.decompress(data)
+        if encoding == "deflate":
+            try:
+                return zlib.decompress(data)
+            except zlib.error:
+                return zlib.decompress(data, -zlib.MAX_WBITS)
+        return data
+
+    def get(self, url: str, retries: int = 4) -> bytes:
+        last_error: Exception | None = None
+        for attempt in range(retries + 1):
+            if self.cancel.is_set():
+                raise Cancelled()
+            self._throttle()
+            req = urllib.request.Request(url, headers={
+                "User-Agent": self.user_agent,
+                "Accept-Encoding": "gzip, deflate",
+            })
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = resp.read()
+                    enc = resp.headers.get("Content-Encoding", "")
+                self.request_count += 1
+                return self._decode(data, enc)
+            except urllib.error.HTTPError as exc:
+                self.request_count += 1
+                if exc.code == 404:
+                    raise NotFound(url) from None
+                try:
+                    body = exc.read()[:4000]
+                except Exception:
+                    body = b""
+                if exc.code == 403 and (b"Undeclared Automated Tool" in body
+                                        or b"User-Agent" in body
+                                        or b"user agent" in body.lower()):
+                    raise SecAccessDenied(
+                        "SEC rejected the request because of the User-Agent. Enter your real "
+                        "name and email in the 'SEC contact' box (e.g. 'Jane Doe jane@example.com')."
+                    ) from None
+                if exc.code in (403, 429, 500, 502, 503, 504):
+                    last_error = exc
+                    if exc.code == 403 and attempt >= 2:
+                        break
+                    wait = min(60.0, (2 ** attempt) * (5.0 if exc.code in (403, 429) else 1.5))
+                    self._sleep(wait)
+                    continue
+                raise
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+                last_error = exc
+                self._sleep(min(30.0, 2 ** attempt))
+        if isinstance(last_error, urllib.error.HTTPError) and last_error.code == 403:
+            raise SecAccessDenied(f"SEC returned 403 Forbidden for {url}")
+        raise last_error if last_error else RuntimeError(f"Failed to fetch {url}")
+
+
+# ----------------------------------------------------------------------------
+# Local cache (sqlite, stdlib)
+# ----------------------------------------------------------------------------
+class Cache:
+    def __init__(self, path: str):
+        self.conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS filings (acc TEXT PRIMARY KEY, ver INTEGER, data TEXT)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS blobs (key TEXT PRIMARY KEY, ts REAL, data BLOB)")
+        self.conn.commit()
+        self._pending = 0
+
+    def get_filing(self, acc: str) -> dict | None:
+        row = self.conn.execute("SELECT data FROM filings WHERE acc=? AND ver=?",
+                                (acc, CACHE_VERSION)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def put_filing(self, acc: str, record: dict) -> None:
+        self.conn.execute("INSERT OR REPLACE INTO filings (acc, ver, data) VALUES (?,?,?)",
+                          (acc, CACHE_VERSION, json.dumps(record, separators=(",", ":"))))
+        self._pending += 1
+        if self._pending >= 100:
+            self.flush()
+
+    def get_blob(self, key: str, max_age: float | None = None) -> bytes | None:
+        row = self.conn.execute("SELECT ts, data FROM blobs WHERE key=?", (key,)).fetchone()
+        if not row:
+            return None
+        if max_age is not None and time.time() - row[0] > max_age:
+            return None
+        return row[1]
+
+    def put_blob(self, key: str, data: bytes) -> None:
+        self.conn.execute("INSERT OR REPLACE INTO blobs (key, ts, data) VALUES (?,?,?)",
+                          (key, time.time(), data))
+        self.flush()
+
+    def flush(self) -> None:
+        self.conn.commit()
+        self._pending = 0
+
+    def close(self) -> None:
+        try:
+            self.flush()
+            self.conn.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def clear_all() -> None:
+        conn = sqlite3.connect(cache_path(), timeout=30)
+        conn.execute("DROP TABLE IF EXISTS filings")
+        conn.execute("DROP TABLE IF EXISTS blobs")
+        conn.commit()
+        conn.execute("VACUUM")
+        conn.close()
+
+
+# ----------------------------------------------------------------------------
+# Form 4 parsing
+# ----------------------------------------------------------------------------
+def _strip_ns(root: ET.Element) -> None:
+    for el in root.iter():
+        if isinstance(el.tag, str) and "}" in el.tag:
+            el.tag = el.tag.split("}", 1)[1]
+
+
+def _txt(el: ET.Element | None, path: str) -> str:
+    if el is None:
+        return ""
+    node = el.find(path)
+    if node is None or node.text is None:
+        return ""
+    return node.text.strip()
+
+
+def _val(el: ET.Element | None, path: str) -> str:
+    return _txt(el, path + "/value") or _txt(el, path)
+
+
+def _flag(el: ET.Element | None, path: str) -> bool:
+    return _txt(el, path).lower() in ("1", "true", "yes")
+
+
+def _num(text: str) -> float | None:
+    text = (text or "").replace(",", "").replace("$", "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+PLAN_RE = re.compile(r"10b5\s*-?\s*1", re.I)
+NOT_PLAN_RE = re.compile(r"\bnot\b[^.;]{0,80}10b5\s*-?\s*1|10b5\s*-?\s*1[^.;]{0,40}\b(?:terminated|cancell?ed)\b", re.I)
+
+
+def _footnote_ids(el: ET.Element) -> list:
+    return [f.get("id", "") for f in el.iter("footnoteId") if f.get("id")]
+
+
+def parse_ownership_xml(xml_bytes: bytes, record: dict) -> dict:
+    root = ET.fromstring(xml_bytes)
+    _strip_ns(root)
+    record["schema"] = _txt(root, "schemaVersion")
+    # Form 4 checkbox (since 2023): "transaction made pursuant to a 10b5-1 plan"
+    record["plan10b5"] = _flag(root, "aff10b5One")
+    plan_notes = []
+    for fn in root.findall("footnotes/footnote"):
+        text = " ".join("".join(fn.itertext()).split())
+        if PLAN_RE.search(text) and not NOT_PLAN_RE.search(text):
+            plan_notes.append(fn.get("id", ""))
+    if not record.get("form"):
+        record["form"] = _txt(root, "documentType")
+    issuer = root.find("issuer")
+    record["issuer_cik"] = _txt(issuer, "issuerCik").lstrip("0")
+    record["issuer_name"] = _txt(issuer, "issuerName")
+    record["ticker"] = _txt(issuer, "issuerTradingSymbol").upper()
+    owners = []
+    for ro in root.findall("reportingOwner"):
+        rid = ro.find("reportingOwnerId")
+        rel = ro.find("reportingOwnerRelationship")
+        owners.append({
+            "name": _txt(rid, "rptOwnerName"),
+            "cik": _txt(rid, "rptOwnerCik").lstrip("0"),
+            "dir": _flag(rel, "isDirector"),
+            "off": _flag(rel, "isOfficer"),
+            "ten": _flag(rel, "isTenPercentOwner"),
+            "oth": _flag(rel, "isOther"),
+            "title": _txt(rel, "officerTitle"),
+            "other": _txt(rel, "otherText"),
+        })
+    record["owners"] = owners
+    txns = []
+    for table, tag in (("N", "nonDerivativeTable/nonDerivativeTransaction"),
+                       ("D", "derivativeTable/derivativeTransaction")):
+        for t in root.findall(tag):
+            txns.append({
+                "t": table,
+                "code": _txt(t, "transactionCoding/transactionCode").upper(),
+                "sh": _num(_val(t, "transactionAmounts/transactionShares")),
+                "px": _num(_val(t, "transactionAmounts/transactionPricePerShare")),
+                "ad": _val(t, "transactionAmounts/transactionAcquiredDisposedCode").upper(),
+                "date": _val(t, "transactionDate")[:10],
+                "sec": _val(t, "securityTitle"),
+                "after": _num(_val(t, "postTransactionAmounts/sharesOwnedFollowingTransaction")),
+                "own": _val(t, "ownershipNature/directOrIndirectOwnership").upper() or "D",
+                "nat": _val(t, "ownershipNature/natureOfOwnership"),
+                "plan": bool(set(_footnote_ids(t)) & set(plan_notes)),
+            })
+    record["txns"] = txns
+    return record
+
+
+def parse_submission(raw: bytes, accession: str, fallback_date: str = "") -> dict:
+    """Parse a full EDGAR submission (.txt) that contains a Form 4 XML document."""
+    record = {"acc": accession, "filing_date": fallback_date, "form": "", "issuer_cik": "",
+              "issuer_name": "", "ticker": "", "schema": "", "xml_file": "",
+              "owners": [], "txns": [], "plan10b5": False, "error": ""}
+    m = re.search(rb"FILED AS OF DATE:\s*(\d{8})", raw)
+    if m:
+        d = m.group(1).decode()
+        record["filing_date"] = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    m = re.search(rb"CONFORMED SUBMISSION TYPE:\s*(\S+)", raw)
+    if m:
+        record["form"] = m.group(1).decode("latin-1")
+
+    xml_bytes = None
+    for doc in re.finditer(rb"<DOCUMENT>(.*?)</DOCUMENT>", raw, re.S | re.I):
+        body = doc.group(1)
+        xm = re.search(rb"<XML>\s*(.*?)\s*</XML>", body, re.S | re.I)
+        if xm and b"ownershipDocument" in xm.group(1):
+            xml_bytes = xm.group(1)
+            fn = re.search(rb"<FILENAME>([^\r\n<]+)", body, re.I)
+            if fn:
+                record["xml_file"] = fn.group(1).strip().decode("latin-1")
+            break
+    if xml_bytes is None and b"<ownershipDocument" in raw:      # bare XML document
+        xml_bytes = raw[raw.find(b"<"):]
+    if xml_bytes is None:
+        record["error"] = "No ownershipDocument XML found"
+        return record
+    try:
+        parse_ownership_xml(xml_bytes, record)
+    except ET.ParseError as exc:
+        record["error"] = f"XML parse error: {exc}"
+    return record
+
+
+def owner_roles(owner: dict) -> set:
+    text = " | ".join(x for x in (owner.get("title", ""), owner.get("other", "")) if x)
+    roles = set()
+    for role in (ROLE_CEO, ROLE_CFO, ROLE_LEGAL):
+        if ROLE_PATTERNS[role].search(text):
+            roles.add(role)
+    if owner.get("dir") or owner.get("ten"):
+        roles.add(ROLE_DIR)
+    else:
+        for part in (owner.get("title", ""), owner.get("other", "")):
+            if part and ROLE_PATTERNS[ROLE_DIR].search(part):
+                roles.add(ROLE_DIR)
+    return roles
+
+
+def owner_title_text(owner: dict) -> str:
+    parts = []
+    if owner.get("title"):
+        parts.append(owner["title"])
+    elif owner.get("off"):
+        parts.append("Officer")
+    if owner.get("dir"):
+        parts.append("Director")
+    if owner.get("ten"):
+        parts.append("10% Owner")
+    if owner.get("other"):
+        parts.append(owner["other"])
+    elif owner.get("oth") and not parts:
+        parts.append("Other")
+    seen, out = set(), []
+    for p in parts:
+        if p.lower() not in seen:
+            seen.add(p.lower())
+            out.append(p)
+    return ", ".join(out)
+
+
+def stake_change_pct(lots: list) -> float | None:
+    """% change in the insider's holding caused by these lots.
+
+    Uses 'shares owned following transaction' per ownership line (direct, or each
+    indirect holder). Returns +inf for a brand-new position, None if unknown.
+    """
+    lines: dict = {}
+    for x in lots:
+        lines.setdefault((x.get("own") or "D", x.get("nat", "")), []).append(x)
+    before_total = after_total = 0.0
+    for group in lines.values():
+        after = group[-1].get("after")
+        if after is None:
+            return None
+        signed = sum((g.get("sh") or 0.0) * (-1 if g.get("ad") == "D" else 1) for g in group)
+        before_total += max(0.0, after - signed)
+        after_total += after
+    if before_total <= 0:
+        return float("inf") if after_total > 0 else None
+    return (after_total - before_total) / before_total * 100.0
+
+
+def fmt_stake(pct: float | None) -> str:
+    if pct is None:
+        return ""
+    if pct == float("inf"):
+        return "New"
+    return f"{pct:+,.1f}%"
+
+
+def owner_key(record: dict) -> str:
+    o = record["owners"][0]
+    return o.get("cik") or o.get("name", "").lower()
+
+
+def sec_links(record: dict, fallback_cik: str = "") -> tuple[str, str]:
+    """Return (rendered Form 4 URL, filing index URL)."""
+    acc = record["acc"]
+    nodash = acc.replace("-", "")
+    cik = record.get("issuer_cik") or fallback_cik
+    base = f"{SEC_WWW}/Archives/edgar/data/{cik}/{nodash}"
+    index_url = f"{base}/{acc}-index.htm"
+    schema, xml_file = record.get("schema", ""), record.get("xml_file", "")
+    if xml_file and re.fullmatch(r"X0\d{3}", schema or ""):
+        return f"{base}/xslF345{schema[:3]}/{xml_file}", index_url
+    return index_url, index_url
+
+
+# ----------------------------------------------------------------------------
+# Scan parameters and filtering
+# ----------------------------------------------------------------------------
+@dataclass
+class ScanParams:
+    start: dt.date
+    end: dt.date
+    user_agent: str
+    tickers: list = field(default_factory=list)
+    roles: set = field(default_factory=set)          # empty = any insider
+    codes: set = field(default_factory=lambda: {"P"})
+    min_value: float = 50000.0
+    include_amendments: bool = False
+    combine_lots: bool = True
+
+
+def cluster_key(record: dict, code: str) -> str:
+    return f"{record.get('issuer_cik') or record.get('ticker', '')}|{code}"
+
+
+def issuer_matches(record: dict, cand: dict) -> bool:
+    want = cand.get("issuer_cik")
+    return not (want and record.get("issuer_cik") and str(want) != str(record["issuer_cik"]))
+
+
+def evaluate_record(record: dict, cand: dict, params: ScanParams) -> list[dict]:
+    """Apply role / code / value filters to one parsed filing; return result rows."""
+    if record.get("error") or not record.get("owners"):
+        return []
+    if not issuer_matches(record, cand):
+        return []          # company is the *reporting owner* here, not the issuer
+
+    all_roles: set = set()
+    for o in record["owners"]:
+        all_roles |= owner_roles(o)
+    if params.roles:
+        matched = all_roles & params.roles
+        if not matched:
+            return []
+    else:
+        matched = all_roles
+    role_text = ", ".join(r for r in ROLE_ORDER if r in matched)
+    if not role_text:
+        role_text = "Officer" if any(o.get("off") for o in record["owners"]) else "Other"
+
+    names = [o["name"] for o in record["owners"] if o.get("name")]
+    titles = [owner_title_text(o) for o in record["owners"]]
+    insider = "; ".join(names)
+    title = "; ".join(t for t in titles if t)
+
+    groups: dict[str, list] = {}
+    for t in record.get("txns", []):
+        # Common-stock (non-derivative) table only: avoids double counting option
+        # exercises and meaningless "values" on option grants.
+        if t.get("t") != "N" or t.get("code") not in params.codes:
+            continue
+        groups.setdefault(t["code"], []).append(t)
+
+    link, index_link = sec_links(record, cand.get("path_cik", ""))
+    rows = []
+    for code in sorted(groups):
+        items = groups[code]
+        chunks = [items] if params.combine_lots else [[x] for x in items]
+        for chunk in chunks:
+            shares = sum((x.get("sh") or 0.0) for x in chunk)
+            value = sum((x.get("sh") or 0.0) * (x.get("px") or 0.0) for x in chunk)
+            price = (value / shares) if shares else (chunk[0].get("px") or 0.0)
+            if value < params.min_value:
+                continue
+            dates = sorted({x.get("date", "") for x in chunk if x.get("date")})
+            plan = bool(record.get("plan10b5")) or any(x.get("plan") for x in chunk)
+            rows.append({
+                "filing_date": record.get("filing_date") or cand.get("date", ""),
+                "ticker": record.get("ticker") or cand.get("ticker", "") or "",
+                "company": record.get("issuer_name", ""),
+                "insider": insider,
+                "role": role_text,
+                "title": title,
+                "side": TXN_CODES.get(code, ("", code))[1],
+                "code": code,
+                "shares": shares,
+                "price": price,
+                "value": value,
+                "link": link,
+                "index_link": index_link,
+                "trade_dates": ", ".join(dates),
+                "lots": len(chunk),
+                "form": record.get("form", ""),
+                "acc": record["acc"],
+                "stake": stake_change_pct(chunk),
+                "plan": plan,
+                "cluster_key": cluster_key(record, code),
+                "cluster": 1,
+                "cluster_disc": 0 if plan else 1,
+            })
+    return rows
+
+
+# ----------------------------------------------------------------------------
+# EDGAR discovery
+# ----------------------------------------------------------------------------
+def load_ticker_map(client: SecClient, cache: Cache) -> dict:
+    raw = cache.get_blob("company_tickers", max_age=3 * 86400)
+    if raw is None:
+        raw = client.get(f"{SEC_WWW}/files/company_tickers.json")
+        cache.put_blob("company_tickers", raw)
+    data = json.loads(raw)
+    out = {}
+    for v in data.values():
+        out[str(v["ticker"]).upper()] = (int(v["cik_str"]), v.get("title", ""))
+    return out
+
+
+def daily_index_entries(client: SecClient, cache: Cache, day: dt.date) -> list | None:
+    """Form 4 / 4/A entries from EDGAR's daily master index. None = no index for that day."""
+    key = f"dailyidx:{day:%Y%m%d}"
+    cached = cache.get_blob(key)
+    if cached is not None:
+        return json.loads(cached)
+    qtr = (day.month - 1) // 3 + 1
+    url = f"{SEC_WWW}/Archives/edgar/daily-index/{day.year}/QTR{qtr}/master.{day:%Y%m%d}.idx"
+    try:
+        raw = client.get(url)
+    except NotFound:
+        return None
+    entries = []
+    for line in raw.decode("latin-1").splitlines():
+        parts = line.split("|")
+        if len(parts) != 5:
+            continue
+        cik, _name, form, date_filed, fname = (p.strip() for p in parts)
+        if form not in ("4", "4/A") or not fname.startswith("edgar/"):
+            continue
+        if re.fullmatch(r"\d{8}", date_filed):
+            date_filed = f"{date_filed[:4]}-{date_filed[4:6]}-{date_filed[6:]}"
+        entries.append([form, fname, date_filed, cik])
+    if day < dt.date.today():
+        cache.put_blob(key, json.dumps(entries).encode())
+    return entries
+
+
+# ----------------------------------------------------------------------------
+# Scanner (runs on a background thread)
+# ----------------------------------------------------------------------------
+class Scanner:
+    def __init__(self, params: ScanParams, out_q: queue.Queue, cancel: threading.Event, scan_id: int = 0):
+        self.p = params
+        self.q = out_q
+        self.cancel = cancel
+        self.scan_id = scan_id
+        # cluster_key -> {"all": set(insiders), "disc": set(insiders not trading under a 10b5-1 plan)}
+        self.clusters: dict[str, dict] = {}
+        self._changed: set = set()
+
+    def post(self, kind: str, payload=None) -> None:
+        self.q.put((self.scan_id, kind, payload))
+
+    def check_cancel(self) -> None:
+        if self.cancel.is_set():
+            raise Cancelled()
+
+    # -- discovery ---------------------------------------------------------
+    def _forms(self) -> set:
+        return {"4", "4/A"} if self.p.include_amendments else {"4"}
+
+    def _company_filings(self, client: SecClient, cik: int):
+        start, end = self.p.start.isoformat(), self.p.end.isoformat()
+        data = json.loads(client.get(f"{SEC_DATA}/submissions/CIK{cik:010d}.json"))
+        filings = data.get("filings", {})
+        blocks = [filings.get("recent", {})]
+        recent_dates = blocks[0].get("filingDate", [])
+        oldest = min(recent_dates) if recent_dates else None
+        if oldest and oldest > start:
+            for f in filings.get("files", []):
+                if f.get("filingTo", "") >= start and f.get("filingFrom", "9999") <= end:
+                    self.check_cancel()
+                    blocks.append(json.loads(client.get(f"{SEC_DATA}/submissions/{f['name']}")))
+        for b in blocks:
+            for acc, fdate, form in zip(b.get("accessionNumber", []), b.get("filingDate", []), b.get("form", [])):
+                if start <= fdate <= end:
+                    yield acc, fdate, form
+
+    def _latest_feed(self, client: SecClient, want_days: set, forms: set, cands: dict) -> int:
+        """Today's filings aren't in the daily index until evening - use the 'latest filings' feed."""
+        added, start = 0, 0
+        min_day = min(want_days)
+        for _page in range(40):
+            self.check_cancel()
+            url = (f"{SEC_WWW}/cgi-bin/browse-edgar?action=getcurrent&type=4&company=&dateb="
+                   f"&owner=include&start={start}&count=100&output=atom")
+            root = ET.fromstring(client.get(url))
+            _strip_ns(root)
+            entries = root.findall("entry")
+            if not entries:
+                break
+            oldest = None
+            for e in entries:
+                form = _txt(e, "title").split(" - ", 1)[0].strip()
+                updated = _txt(e, "updated")[:10]
+                link = e.find("link")
+                href = link.get("href", "") if link is not None else ""
+                m = re.search(r"/data/(\d+)/(\d{18})/(\d{10}-\d{2}-\d{6})-index", href)
+                try:
+                    day = dt.date.fromisoformat(updated)
+                except ValueError:
+                    continue
+                oldest = day if oldest is None else min(oldest, day)
+                if m and form in forms and day in want_days:
+                    cik, nodash, acc = m.groups()
+                    if acc not in cands:
+                        cands[acc] = {"acc": acc, "path": f"edgar/data/{cik}/{nodash}/{acc}.txt",
+                                      "date": updated, "issuer_cik": None, "path_cik": cik}
+                        added += 1
+            if oldest is not None and oldest < min_day:
+                break
+            start += 100
+        return added
+
+    def gather(self, client: SecClient, cache: Cache) -> dict:
+        p, forms, cands = self.p, self._forms(), {}
+        if p.tickers:
+            self.post("phase", "Loading SEC ticker list...")
+            tmap = load_ticker_map(client, cache)
+            unknown = []
+            for t in p.tickers:
+                self.check_cancel()
+                hit = tmap.get(t.upper().replace(".", "-")) or tmap.get(t.upper())
+                if not hit:
+                    unknown.append(t)
+                    continue
+                cik, _title = hit
+                self.post("phase", f"Listing Form 4 filings for {t}...")
+                for acc, fdate, form in self._company_filings(client, cik):
+                    if form in forms and acc not in cands:
+                        cands[acc] = {"acc": acc, "date": fdate, "ticker": t.upper(),
+                                      "path": f"edgar/data/{cik}/{acc.replace('-', '')}/{acc}.txt",
+                                      "issuer_cik": str(cik), "path_cik": str(cik)}
+            if unknown:
+                self.post("warn", "Ticker(s) not found in SEC list and skipped: " + ", ".join(unknown))
+            return cands
+
+        day, missing, weekdays, denied = p.start, [], 0, 0
+        while day <= p.end:
+            self.check_cancel()
+            if day.weekday() < 5:
+                weekdays += 1
+                self.post("phase", f"Reading EDGAR daily index for {day:%a %b %d, %Y}...")
+                try:
+                    entries = daily_index_entries(client, cache, day)
+                except SecAccessDenied as exc:
+                    if "User-Agent" in str(exc):
+                        raise
+                    entries, denied = None, denied + 1
+                if entries is None:
+                    missing.append(day)
+                else:
+                    for form, fname, fdate, cik in entries:
+                        if form not in forms:
+                            continue
+                        acc = fname.rsplit("/", 1)[-1].replace(".txt", "")
+                        if acc not in cands:
+                            cands[acc] = {"acc": acc, "path": fname, "date": fdate,
+                                          "issuer_cik": None, "path_cik": cik}
+            day += dt.timedelta(days=1)
+        if weekdays and denied == weekdays:
+            raise SecAccessDenied("SEC refused every index request (403). Check your SEC contact / network.")
+        recent = {d for d in missing if d >= dt.date.today() - dt.timedelta(days=4)}
+        if recent:
+            self.post("phase", "Today's index isn't published yet - checking EDGAR latest-filings feed...")
+            try:
+                self._latest_feed(client, recent, forms, cands)
+            except Cancelled:
+                raise
+            except Exception as exc:  # best effort
+                self.post("warn", f"Could not read EDGAR latest-filings feed: {exc}")
+        return cands
+
+    # -- clusters ------------------------------------------------------------
+    def track(self, rec: dict, cand: dict) -> None:
+        """Record which insiders traded each issuer, by code (any size / role)."""
+        if rec.get("error") or not rec.get("owners") or not issuer_matches(rec, cand):
+            return
+        who = owner_key(rec)
+        by_code: dict[str, bool] = {}
+        for t in rec.get("txns", []):
+            if t.get("t") == "N" and t.get("code") in TXN_CODES:
+                discretionary = not (rec.get("plan10b5") or t.get("plan"))
+                by_code[t["code"]] = by_code.get(t["code"], False) or discretionary
+        for code, disc in by_code.items():
+            key = cluster_key(rec, code)
+            entry = self.clusters.setdefault(key, {"all": set(), "disc": set()})
+            n_all, n_disc = len(entry["all"]), len(entry["disc"])
+            entry["all"].add(who)
+            if disc:
+                entry["disc"].add(who)
+            if (len(entry["all"]), len(entry["disc"])) != (n_all, n_disc):
+                self._changed.add(key)
+
+    def flush_clusters(self, force: bool = False) -> None:  # noqa: ARG002
+        if self._changed:
+            self.post("clusters", {k: (len(self.clusters[k]["all"]), len(self.clusters[k]["disc"]))
+                                   for k in self._changed})
+            self._changed = set()
+
+    # -- main loop ---------------------------------------------------------
+    @staticmethod
+    def _fetch_one(client: SecClient, cand: dict) -> dict:
+        raw = client.get(f"{SEC_WWW}/Archives/{cand['path']}")
+        return parse_submission(raw, cand["acc"], cand.get("date", ""))
+
+    def run(self) -> None:
+        stats = {"total": 0, "done": 0, "failed": 0, "matched": 0, "cached": 0, "requests": 0}
+        cache = None
+        client = SecClient(self.p.user_agent, self.cancel)
+        try:
+            cache = Cache(cache_path())
+            self.post("phase", "Collecting list of Form 4 filings...")
+            cands = self.gather(client, cache)
+            stats["total"] = len(cands)
+            self.post("total", len(cands))
+            if not cands:
+                stats["requests"] = client.request_count
+                self.post("done", stats)
+                return
+
+            todo = []
+            for i, (acc, cand) in enumerate(cands.items()):
+                if i % 200 == 0:
+                    self.check_cancel()
+                rec = cache.get_filing(acc)
+                if rec is None:
+                    todo.append(cand)
+                    continue
+                stats["cached"] += 1
+                stats["done"] += 1
+                self.track(rec, cand)
+                rows = evaluate_record(rec, cand, self.p)
+                if rows:
+                    stats["matched"] += len(rows)
+                    self.post("rows", rows)
+                if stats["done"] % 250 == 0:
+                    self.flush_clusters()
+                    self.post("progress", dict(stats))
+            self.flush_clusters()
+            self.post("progress", dict(stats))
+
+            if todo:
+                mins = len(todo) / MAX_REQUESTS_PER_SECOND / 60
+                eta = f"~{mins:.0f} min" if mins >= 1 else "< 1 min"
+                self.post("phase", f"Downloading {len(todo):,} filings from SEC ({eta}; "
+                                   f"{stats['cached']:,} already cached)...")
+                ex = ThreadPoolExecutor(max_workers=FETCH_WORKERS)
+                try:
+                    futures = {ex.submit(self._fetch_one, client, c): c for c in todo}
+                    for fut in as_completed(futures):
+                        cand = futures[fut]
+                        try:
+                            rec = fut.result()
+                        except Cancelled:
+                            raise
+                        except SecAccessDenied as exc:
+                            if "User-Agent" in str(exc):
+                                raise
+                            rec = None
+                        except Exception:
+                            rec = None
+                        if rec is None:
+                            stats["failed"] += 1
+                        else:
+                            cache.put_filing(cand["acc"], rec)
+                            self.track(rec, cand)
+                            rows = evaluate_record(rec, cand, self.p)
+                            if rows:
+                                stats["matched"] += len(rows)
+                                self.post("rows", rows)
+                        stats["done"] += 1
+                        if stats["done"] % 25 == 0:
+                            self.flush_clusters()
+                        self.post("progress", dict(stats))
+                        self.check_cancel()
+                finally:
+                    ex.shutdown(wait=False, cancel_futures=True)
+            self.flush_clusters(force=True)
+            stats["requests"] = client.request_count
+            self.post("done", stats)
+        except Cancelled:
+            self.flush_clusters(force=True)
+            stats["requests"] = client.request_count
+            self.post("cancelled", stats)
+        except SecAccessDenied as exc:
+            self.post("error", str(exc))
+        except Exception as exc:
+            self.post("error", f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc(limit=4)}")
+        finally:
+            if cache:
+                cache.close()
+
+
+# ----------------------------------------------------------------------------
+# Helpers shared by GUI and CLI
+# ----------------------------------------------------------------------------
+def parse_tickers(text: str) -> list[str]:
+    out = []
+    for tok in re.split(r"[,\s;]+", text or ""):
+        tok = tok.strip().lstrip("$").upper()
+        if tok and tok not in out:
+            out.append(tok)
+    return out
+
+
+def valid_user_agent(ua: str) -> bool:
+    return bool(re.search(r"\S+@\S+\.\S+", ua or ""))
+
+
+def fmt_money(v: float, decimals: int = 0) -> str:
+    return f"${v:,.{decimals}f}"
+
+
+def fmt_compact(v: float) -> str:
+    for div, suf in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(v) >= div:
+            return f"${v / div:.1f}{suf}"
+    return f"${v:,.0f}"
+
+
+CSV_HEADERS = ["Filing Date", "Ticker", "Company", "Insider Name", "Matched Role", "Exact Title",
+               "Buy/Sell", "Transaction Code", "Shares", "Price", "Total Value ($)", "Stake Change %",
+               "Cluster (insiders)", "Cluster excl. 10b5-1", "10b5-1 Plan", "Trade Date(s)",
+               "Lots", "Form", "Accession", "SEC Link", "Filing Index"]
+
+
+def row_to_csv(r: dict) -> list:
+    stake = r.get("stake")
+    stake_out = "" if stake is None else ("New position" if stake == float("inf") else round(stake, 2))
+    return [r["filing_date"], r["ticker"], r["company"], r["insider"], r["role"], r["title"],
+            r["side"], r["code"], round(r["shares"], 4), round(r["price"], 4), round(r["value"], 2),
+            stake_out, r.get("cluster", 1), r.get("cluster_disc", 1), "Yes" if r.get("plan") else "No",
+            r["trade_dates"], r["lots"], r["form"], r["acc"], r["link"], r["index_link"]]
+
+
+# ============================================================================
+# GUI
+# ============================================================================
+def resource_path(name: str) -> str:
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+
+def run_gui() -> None:
+    import tkinter as tk
+    import tkinter.font as tkfont
+    from tkinter import filedialog, messagebox, ttk
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Form4Scanner.InsiderScanner")
+        except Exception:
+            pass
+
+    INF = float("inf")
+    COLUMNS = [
+        # key, heading, width, anchor, numeric
+        ("filing_date", "Filing Date", 100, "w", False),
+        ("ticker", "Ticker", 64, "w", False),
+        ("company", "Company", 170, "w", False),
+        ("insider", "Insider Name", 160, "w", False),
+        ("role", "Matched Role", 140, "w", False),
+        ("title", "Exact Title", 165, "w", False),
+        ("side", "Buy/Sell", 80, "center", False),
+        ("shares", "Shares", 90, "e", True),
+        ("price", "Price", 80, "e", True),
+        ("value", "Total Value ($)", 128, "e", True),
+        ("stake", "Stake Δ %", 96, "e", True),
+        ("cluster", "Cluster", 72, "center", True),
+        ("plan", "10b5-1", 72, "center", False),
+        ("link", "SEC Link", 330, "w", False),
+    ]
+    HEADINGS = {c[0]: c[1] for c in COLUMNS}
+    TOOLTIPS = {
+        "stake": "How much this trade grew (or shrank) the insider's holding. 'New' = first shares.",
+        "cluster": "Number of different insiders making the same kind of trade in this company during the scanned dates.",
+        "plan": "Yes = made under a pre-scheduled Rule 10b5-1 trading plan (less informative).",
+    }
+
+    class App:
+        def __init__(self, root: tk.Tk):
+            self.root = root
+            self.settings = load_settings()
+            self.q: queue.Queue = queue.Queue()
+            self.cancel_event: threading.Event | None = None
+            self.worker: threading.Thread | None = None
+            self.scan_id = 0
+            self.rows: dict[str, dict] = {}       # iid -> row
+            self.order: list[str] = []            # all iids in current sort order
+            self.clusters: dict[str, tuple] = {}  # cluster_key -> (all, discretionary)
+            self.by_cluster: dict[str, list] = {} # cluster_key -> [iid]
+            self.sort_key, self.sort_desc = None, False
+            self.scan_started = 0.0
+            self._view_job = None
+
+            root.title(APP_NAME)
+            root.geometry("1500x900")
+            root.minsize(1100, 660)
+            try:
+                ico = resource_path(os.path.join("assets", "app.ico"))
+                if sys.platform == "win32" and os.path.exists(ico):
+                    root.iconbitmap(default=ico)
+                else:
+                    png = resource_path(os.path.join("assets", "app.png"))
+                    if os.path.exists(png):
+                        self._icon_img = tk.PhotoImage(file=png)
+                        root.iconphoto(True, self._icon_img)
+            except Exception:
+                pass
+            self._style()
+            self._menu()
+            self._controls()
+            self._table()
+            self._footer()
+            self._on_range_change()
+            root.protocol("WM_DELETE_WINDOW", self.on_close)
+            root.after(100, self._poll)
+
+        # ---- look & feel ------------------------------------------------
+        def _style(self):
+            s = ttk.Style(self.root)
+            for theme in ("vista", "clam"):
+                if theme in s.theme_names():
+                    s.theme_use(theme)
+                    break
+            base = ("Segoe UI", 10) if sys.platform == "win32" else ("DejaVu Sans", 10)
+            self.base_font = base
+            for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+                try:
+                    tkfont.nametofont(name).configure(family=base[0], size=base[1])
+                except tk.TclError:
+                    pass
+            linespace = tkfont.Font(family=base[0], size=base[1]).metrics("linespace")
+            s.configure(".", font=base)
+            s.configure("Treeview", font=base, rowheight=max(24, int(linespace * 1.55)))
+            s.configure("Treeview.Heading", font=(base[0], base[1], "bold"))
+            s.configure("Title.TLabel", font=(base[0], 15, "bold"))
+            s.configure("Sub.TLabel", foreground="#5b6470")
+            s.configure("Hint.TLabel", foreground="#6b7480", font=(base[0], 9))
+            s.configure("Big.TButton", font=(base[0], 10, "bold"), padding=(14, 6))
+            s.configure("TLabelframe.Label", font=(base[0], 10, "bold"))
+            self.bold_font = tkfont.Font(family=base[0], size=base[1], weight="bold")
+
+            def fixed_map(option):   # Tk 8.6.9 Treeview tag-colour bug
+                return [e for e in s.map("Treeview", query_opt=option) if e[:2] != ("!disabled", "!selected")]
+            s.map("Treeview", foreground=fixed_map("foreground"), background=fixed_map("background"))
+
+        def _menu(self):
+            m = tk.Menu(self.root)
+            fm = tk.Menu(m, tearoff=0)
+            fm.add_command(label="Export Results to CSV...", command=self.export_csv, accelerator="Ctrl+E")
+            fm.add_separator()
+            fm.add_command(label="Open Data Folder", command=self.open_data_folder)
+            fm.add_command(label="Clear Download Cache", command=self.clear_cache)
+            fm.add_separator()
+            fm.add_command(label="Exit", command=self.on_close)
+            m.add_cascade(label="File", menu=fm)
+            hm = tk.Menu(m, tearoff=0)
+            hm.add_command(label="How it works", command=self.show_help)
+            hm.add_command(label="Finding true insider buying", command=self.show_signal_help)
+            hm.add_command(label="SEC EDGAR Form 4 search", command=lambda: webbrowser.open(
+                "https://www.sec.gov/edgar/search/#/forms=4"))
+            m.add_cascade(label="Help", menu=hm)
+            self.root.config(menu=m)
+            self.root.bind_all("<Control-e>", lambda e: self.export_csv())
+
+        # ---- settings panel --------------------------------------------
+        def _controls(self):
+            st = self.settings
+            outer = ttk.Frame(self.root, padding=(14, 10, 14, 4))
+            outer.pack(fill="x")
+            head = ttk.Frame(outer)
+            head.pack(fill="x")
+            ttk.Label(head, text="SEC Form 4 Insider Trading Scanner", style="Title.TLabel").pack(side="left")
+            ttk.Label(head, text="   Insider buys & sells from SEC EDGAR", style="Sub.TLabel").pack(side="left", pady=(5, 0))
+            ttk.Button(head, text="★  True Insider Buying preset", command=self.apply_preset).pack(side="right")
+
+            grid = ttk.Frame(outer)
+            grid.pack(fill="x", pady=(8, 0))
+            grid.columnconfigure(0, weight=1)
+            grid.columnconfigure(1, weight=1)
+
+            # Date range ---------------------------------------------------
+            f = ttk.LabelFrame(grid, text="Date Range (filing date)", padding=(10, 6))
+            f.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=3)
+            self.range_var = tk.StringVar(value=st.get("range", "Last 7 Days"))
+            cb = ttk.Combobox(f, textvariable=self.range_var, values=list(RANGE_CHOICES), state="readonly", width=16)
+            cb.grid(row=0, column=0, padx=(0, 12))
+            cb.bind("<<ComboboxSelected>>", lambda e: self._on_range_change())
+            ttk.Label(f, text="From").grid(row=0, column=1)
+            self.from_var = tk.StringVar(value=st.get("from", ""))
+            self.from_entry = ttk.Entry(f, textvariable=self.from_var, width=12)
+            self.from_entry.grid(row=0, column=2, padx=(4, 10))
+            ttk.Label(f, text="To").grid(row=0, column=3)
+            self.to_var = tk.StringVar(value=st.get("to", ""))
+            self.to_entry = ttk.Entry(f, textvariable=self.to_var, width=12)
+            self.to_entry.grid(row=0, column=4, padx=(4, 6))
+            ttk.Label(f, text="YYYY-MM-DD", style="Hint.TLabel").grid(row=0, column=5, sticky="w")
+
+            # Tickers ------------------------------------------------------
+            f = ttk.LabelFrame(grid, text="Ticker Watchlist (optional)", padding=(10, 6))
+            f.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=3)
+            f.columnconfigure(0, weight=1)
+            self.tickers_var = tk.StringVar(value=st.get("tickers", ""))
+            ttk.Entry(f, textvariable=self.tickers_var).grid(row=0, column=0, sticky="ew")
+            ttk.Label(f, text="e.g. AAPL, MSFT, NVDA  -  leave blank to scan market-wide",
+                      style="Hint.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+            # Roles --------------------------------------------------------
+            f = ttk.LabelFrame(grid, text="Insider Role", padding=(10, 6))
+            f.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=3)
+            saved_roles = set(st.get("roles", []))
+            self.role_vars = {}
+            for i, role in enumerate(ROLE_ORDER):
+                v = tk.BooleanVar(value=role in saved_roles)
+                self.role_vars[role] = v
+                ttk.Checkbutton(f, text=role, variable=v).grid(row=0, column=i, sticky="w", padx=(0, 14))
+            ttk.Label(f, text="None checked = all insiders. Matches officer title / relationship text "
+                             "(case-insensitive).", style="Hint.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 0))
+
+            # Transactions -------------------------------------------------
+            f = ttk.LabelFrame(grid, text="Transactions", padding=(10, 6))
+            f.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=3)
+            saved_codes = set(st.get("codes", ["P"]))
+            self.code_vars = {}
+            for i, (code, (label, _)) in enumerate(TXN_CODES.items()):
+                v = tk.BooleanVar(value=code in saved_codes)
+                self.code_vars[code] = v
+                ttk.Checkbutton(f, text=label, variable=v).grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 14))
+            sub = ttk.Frame(f)
+            sub.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+            ttk.Label(sub, text="Minimum $ value").pack(side="left")
+            self.min_var = tk.StringVar(value=str(st.get("min_value", "50000")))
+            vcmd = (self.root.register(lambda s: re.fullmatch(r"[\d,]*\.?\d*", s) is not None), "%P")
+            ttk.Entry(sub, textvariable=self.min_var, width=12, validate="key", validatecommand=vcmd).pack(side="left", padx=(6, 14))
+            self.amend_var = tk.BooleanVar(value=st.get("amendments", False))
+            ttk.Checkbutton(sub, text="Include 4/A amendments", variable=self.amend_var).pack(side="left", padx=(0, 12))
+            self.combine_var = tk.BooleanVar(value=st.get("combine", True))
+            ttk.Checkbutton(sub, text="Combine lots per filing", variable=self.combine_var).pack(side="left")
+
+            # Signal filters (instant, no re-scan) --------------------------
+            f = ttk.LabelFrame(grid, text="Signal Filters  (apply instantly to the results - no re-scan needed)", padding=(10, 6))
+            f.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=3)
+            self.excl_plan_var = tk.BooleanVar(value=st.get("exclude_plan", True))
+            ttk.Checkbutton(f, text="Exclude pre-planned 10b5-1 trades", variable=self.excl_plan_var,
+                            command=self._view_changed).pack(side="left", padx=(0, 22))
+            self.cluster_only_var = tk.BooleanVar(value=st.get("clusters_only", False))
+            ttk.Checkbutton(f, text="Clusters only - at least", variable=self.cluster_only_var,
+                            command=self._view_changed).pack(side="left")
+            self.cluster_min_var = tk.IntVar(value=int(st.get("cluster_min", 2)))
+            ttk.Spinbox(f, from_=2, to=20, width=4, textvariable=self.cluster_min_var,
+                        command=self._view_changed).pack(side="left", padx=4)
+            ttk.Label(f, text="different insiders").pack(side="left", padx=(0, 22))
+            ttk.Label(f, text="Min stake increase").pack(side="left")
+            self.min_stake_var = tk.StringVar(value=str(st.get("min_stake", "0")))
+            vcmd2 = (self.root.register(lambda s: re.fullmatch(r"\d{0,5}", s) is not None), "%P")
+            e = ttk.Entry(f, textvariable=self.min_stake_var, width=6, validate="key", validatecommand=vcmd2)
+            e.pack(side="left", padx=4)
+            e.bind("<KeyRelease>", lambda ev: self._view_changed())
+            ttk.Label(f, text="%  (0 = off; buys only)").pack(side="left")
+            self.cluster_min_var.trace_add("write", lambda *a: self._view_changed())
+
+            # SEC contact ---------------------------------------------------
+            f = ttk.Frame(outer)
+            f.pack(fill="x", pady=(6, 2))
+            ttk.Label(f, text="SEC contact (User-Agent):").pack(side="left")
+            self.ua_var = tk.StringVar(value=st.get("user_agent", ""))
+            ttk.Entry(f, textvariable=self.ua_var, width=42).pack(side="left", padx=6)
+            ttk.Label(f, text="SEC requires your name + email on automated requests, e.g. \"Jane Doe jane@example.com\"",
+                      style="Hint.TLabel").pack(side="left")
+
+            # Action row -----------------------------------------------------
+            f = ttk.Frame(outer)
+            f.pack(fill="x", pady=(8, 4))
+            self.start_btn = ttk.Button(f, text="▶  Start Scan", style="Big.TButton", command=self.start_scan)
+            self.start_btn.pack(side="left")
+            self.cancel_btn = ttk.Button(f, text="■  Cancel", style="Big.TButton", command=self.cancel_scan, state="disabled")
+            self.cancel_btn.pack(side="left", padx=(8, 0))
+            ttk.Button(f, text="Export CSV...", command=self.export_csv).pack(side="left", padx=(16, 0))
+            ttk.Button(f, text="Clear", command=self.clear_results).pack(side="left", padx=(6, 0))
+            self.progress = ttk.Progressbar(f, mode="determinate", length=300)
+            self.progress.pack(side="left", padx=(20, 10))
+            self.status_var = tk.StringVar(value="Ready.")
+            ttk.Label(f, textvariable=self.status_var).pack(side="left", fill="x", expand=True)
+
+        def _on_range_change(self):
+            days = RANGE_CHOICES.get(self.range_var.get())
+            if days is None:
+                self.from_entry.config(state="normal")
+                self.to_entry.config(state="normal")
+                if not self.from_var.get():
+                    self.from_var.set((dt.date.today() - dt.timedelta(days=7)).isoformat())
+                if not self.to_var.get():
+                    self.to_var.set(dt.date.today().isoformat())
+            else:
+                today = dt.date.today()
+                self.from_var.set((today - dt.timedelta(days=days)).isoformat())
+                self.to_var.set(today.isoformat())
+                self.from_entry.config(state="disabled")
+                self.to_entry.config(state="disabled")
+
+        def apply_preset(self):
+            """Settings that isolate the kind of insider buying research links to returns."""
+            self.range_var.set("Last 30 Days")
+            self._on_range_change()
+            for v in self.role_vars.values():
+                v.set(False)
+            for c, v in self.code_vars.items():
+                v.set(c == "P")
+            self.min_var.set("100000")
+            self.combine_var.set(True)
+            self.amend_var.set(False)
+            self.excl_plan_var.set(True)
+            self.cluster_only_var.set(True)
+            self.cluster_min_var.set(2)
+            self.min_stake_var.set("10")
+            self._view_changed()
+            self.status_var.set("Preset applied: open-market buys ≥ $100k, 30 days, ≥ 2 insiders, "
+                                "no 10b5-1 plans, stake +10%. Click Start Scan.")
+
+        # ---- table ------------------------------------------------------
+        def _table(self):
+            wrap = ttk.Frame(self.root, padding=(14, 2, 14, 0))
+            wrap.pack(fill="both", expand=True)
+            cols = [c[0] for c in COLUMNS]
+            self.tree = ttk.Treeview(wrap, columns=cols, show="headings", selectmode="extended")
+            for key, head, width, anchor, _n in COLUMNS:
+                self.tree.heading(key, text=head, command=lambda k=key: self.sort_by(k))
+                self.tree.column(key, width=width, minwidth=44, anchor=anchor,
+                                 stretch=(key in ("company", "title", "link")))
+            vs = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
+            hs = ttk.Scrollbar(wrap, orient="horizontal", command=self.tree.xview)
+            self.tree.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+            self.tree.grid(row=0, column=0, sticky="nsew")
+            vs.grid(row=0, column=1, sticky="ns")
+            hs.grid(row=1, column=0, sticky="ew")
+            wrap.rowconfigure(0, weight=1)
+            wrap.columnconfigure(0, weight=1)
+            self.tree.tag_configure("Buy", background="#e8f6ec", foreground="#14532d")
+            self.tree.tag_configure("Sell", background="#fbeaea", foreground="#7f1d1d")
+            self.tree.tag_configure("Grant", background="#eef2fb")
+            self.tree.tag_configure("Exercise", background="#f6f1e7")
+            self.tree.tag_configure("hot", background="#c4ecd1", foreground="#0b3d20", font=self.bold_font)
+            self.tree.bind("<Double-1>", self._on_double)
+            self.tree.bind("<Return>", lambda e: self.open_selected())
+            self.tree.bind("<Button-3>", self._on_right_click)
+            self.tree.bind("<Control-c>", lambda e: self.copy_selected())
+            self.tree.bind("<Motion>", self._on_motion)
+            self.tree.bind("<Leave>", lambda e: self._hide_tip())
+            self._tip = None
+
+            self.ctx = tk.Menu(self.root, tearoff=0)
+            self.ctx.add_command(label="Open Form 4 on SEC.gov", command=self.open_selected)
+            self.ctx.add_command(label="Open filing index page", command=lambda: self.open_selected(index=True))
+            self.ctx.add_separator()
+            self.ctx.add_command(label="Show only this ticker", command=self.filter_to_ticker)
+            self.ctx.add_command(label="Show all tickers", command=self.clear_ticker_filter)
+            self.ctx.add_separator()
+            self.ctx.add_command(label="Copy link", command=self.copy_link)
+            self.ctx.add_command(label="Copy row(s)", command=self.copy_selected)
+            self.only_ticker: str | None = None
+
+        def _footer(self):
+            f = ttk.Frame(self.root, padding=(14, 4, 14, 8))
+            f.pack(fill="x")
+            self.summary_var = tk.StringVar(value="No results yet.")
+            ttk.Label(f, textvariable=self.summary_var).pack(side="left")
+            ttk.Label(f, text="Bold green = cluster buy  •  Double-click a row to open the filing  •  "
+                             "Click a header to sort  •  Right-click for more",
+                      style="Hint.TLabel").pack(side="right")
+
+        # header tooltips ---------------------------------------------------
+        def _on_motion(self, event):
+            if self.tree.identify_region(event.x, event.y) != "heading":
+                self._hide_tip()
+                return
+            col = self.tree.identify_column(event.x)
+            try:
+                key = self.tree["columns"][int(col[1:]) - 1]
+            except (ValueError, IndexError):
+                return
+            text = TOOLTIPS.get(key)
+            if not text:
+                self._hide_tip()
+                return
+            if self._tip is None:
+                self._tip = tk.Toplevel(self.root)
+                self._tip.wm_overrideredirect(True)
+                self._tip_label = tk.Label(self._tip, bg="#ffffe1", relief="solid", borderwidth=1,
+                                           padx=6, pady=3, wraplength=320, justify="left")
+                self._tip_label.pack()
+            self._tip_label.config(text=text)
+            self._tip.wm_geometry(f"+{event.x_root + 12}+{event.y_root + 18}")
+
+        def _hide_tip(self):
+            if self._tip is not None:
+                self._tip.destroy()
+                self._tip = None
+
+        # ---- params ------------------------------------------------------
+        def _collect_params(self) -> ScanParams | None:
+            ua = self.ua_var.get().strip()
+            if not valid_user_agent(ua):
+                messagebox.showwarning(APP_NAME, "SEC requires a contact on automated requests.\n\n"
+                                       "Enter your name and email in 'SEC contact', e.g.\n    Jane Doe jane@example.com")
+                return None
+            try:
+                start = dt.date.fromisoformat(self.from_var.get().strip())
+                end = dt.date.fromisoformat(self.to_var.get().strip())
+            except ValueError:
+                messagebox.showwarning(APP_NAME, "Dates must be in YYYY-MM-DD format.")
+                return None
+            end = min(end, dt.date.today())
+            if start > end:
+                messagebox.showwarning(APP_NAME, "'From' date must be on or before 'To' date.")
+                return None
+            codes = {c for c, v in self.code_vars.items() if v.get()}
+            if not codes:
+                messagebox.showwarning(APP_NAME, "Select at least one transaction type.")
+                return None
+            try:
+                min_value = float((self.min_var.get() or "0").replace(",", ""))
+            except ValueError:
+                messagebox.showwarning(APP_NAME, "Minimum $ value must be a number.")
+                return None
+            return ScanParams(
+                start=start, end=end, user_agent=ua,
+                tickers=parse_tickers(self.tickers_var.get()),
+                roles={r for r, v in self.role_vars.items() if v.get()},
+                codes=codes, min_value=min_value,
+                include_amendments=self.amend_var.get(),
+                combine_lots=self.combine_var.get(),
+            )
+
+        def _save(self):
+            save_settings({
+                "range": self.range_var.get(), "from": self.from_var.get(), "to": self.to_var.get(),
+                "tickers": self.tickers_var.get(),
+                "roles": [r for r, v in self.role_vars.items() if v.get()],
+                "codes": [c for c, v in self.code_vars.items() if v.get()],
+                "min_value": self.min_var.get(), "amendments": self.amend_var.get(),
+                "combine": self.combine_var.get(), "user_agent": self.ua_var.get().strip(),
+                "exclude_plan": self.excl_plan_var.get(), "clusters_only": self.cluster_only_var.get(),
+                "cluster_min": self._cluster_min(), "min_stake": self.min_stake_var.get(),
+            })
+
+        # ---- scan control -------------------------------------------------
+        def start_scan(self):
+            if self.worker and self.worker.is_alive():
+                return
+            if RANGE_CHOICES.get(self.range_var.get()):
+                self._on_range_change()          # refresh "last N days" to today
+            p = self._collect_params()
+            if not p:
+                return
+            span = (p.end - p.start).days + 1
+            if not p.tickers and span > 31:
+                if not messagebox.askyesno(APP_NAME, f"A market-wide scan of {span} days can mean tens of "
+                                           "thousands of filings and take an hour or more the first time.\n\nContinue?"):
+                    return
+            self._save()
+            self.clear_results()
+            self.scan_id += 1
+            self.cancel_event = threading.Event()
+            scanner = Scanner(p, self.q, self.cancel_event, self.scan_id)
+            self.worker = threading.Thread(target=scanner.run, name="form4-scan", daemon=True)
+            self.scan_started = time.time()
+            self.progress.config(mode="indeterminate")
+            self.progress.start(12)
+            scope = ", ".join(p.tickers) if p.tickers else "market-wide"
+            self.status_var.set(f"Starting scan ({scope}, {p.start} to {p.end})...")
+            self.start_btn.config(state="disabled")
+            self.cancel_btn.config(state="normal")
+            self.worker.start()
+
+        def cancel_scan(self):
+            if self.cancel_event:
+                self.cancel_event.set()
+                self.status_var.set("Cancelling...")
+                self.cancel_btn.config(state="disabled")
+
+        def _finish(self, done: int | None = None):
+            if str(self.progress.cget("mode")) == "indeterminate":
+                self.progress.stop()
+                self.progress.config(mode="determinate", value=0)
+            if done is not None:
+                self.progress.config(value=done)
+            self.start_btn.config(state="normal")
+            self.cancel_btn.config(state="disabled")
+            if self.rows and self.sort_key is None:
+                self.sort_key, self.sort_desc = "filing_date", False
+                self.sort_by("filing_date")      # toggles to descending
+            else:
+                self._apply_view()
+
+        def _poll(self):
+            try:
+                for _ in range(2000):
+                    sid, kind, payload = self.q.get_nowait()
+                    if sid != self.scan_id:
+                        continue
+                    self._handle(kind, payload)
+            except queue.Empty:
+                pass
+            self.root.after(100, self._poll)
+
+        def _handle(self, kind, payload):
+            if kind == "phase":
+                self.status_var.set(payload)
+            elif kind == "warn":
+                self.status_var.set(payload)
+                messagebox.showinfo(APP_NAME, payload)
+            elif kind == "total":
+                self.progress.stop()
+                self.progress.config(mode="determinate", maximum=max(1, payload), value=0)
+            elif kind == "progress":
+                self.progress.config(value=payload["done"])
+                extra = f", {payload['failed']} failed" if payload["failed"] else ""
+                self.status_var.set(f"Scanned {payload['done']:,} of {payload['total']:,} filings  •  "
+                                    f"{payload['matched']:,} matches{extra}")
+            elif kind == "rows":
+                for r in payload:
+                    self._insert(r)
+                self._update_summary()
+            elif kind == "clusters":
+                self.clusters.update(payload)
+                for key in payload:
+                    for iid in self.by_cluster.get(key, []):
+                        self._refresh_row(iid)
+                if self.cluster_only_var.get():
+                    self._schedule_view()
+            elif kind in ("done", "cancelled"):
+                secs = time.time() - self.scan_started
+                verb = "Scan complete" if kind == "done" else "Scan cancelled"
+                extra = f"  •  {payload['failed']} could not be downloaded" if payload["failed"] else ""
+                if kind == "done" and payload["total"] == 0:
+                    self.status_var.set("No Form 4 filings found for that date range / ticker list.")
+                else:
+                    self.status_var.set(f"{verb}: {payload['done']:,} of {payload['total']:,} filings scanned, "
+                                        f"{payload['matched']:,} matches in {secs:,.0f}s{extra}")
+                self._finish(payload["done"])
+                self._update_summary()
+            elif kind == "error":
+                self.status_var.set("Scan stopped with an error.")
+                self._finish()
+                messagebox.showerror(APP_NAME, payload)
+
+        # ---- rows / view ----------------------------------------------------
+        def _cluster_count(self, r: dict) -> int:
+            all_n, disc_n = self.clusters.get(r["cluster_key"], (1, 0 if r.get("plan") else 1))
+            n = disc_n if self.excl_plan_var.get() else all_n
+            return max(n, 0 if (self.excl_plan_var.get() and r.get("plan")) else 1)
+
+        def _cluster_min(self) -> int:
+            try:
+                return max(2, int(self.cluster_min_var.get()))
+            except (tk.TclError, ValueError):
+                return 2
+
+        def _values(self, r: dict) -> tuple:
+            return (r["filing_date"], r["ticker"], r["company"], r["insider"], r["role"], r["title"],
+                    r["side"], f"{r['shares']:,.0f}", fmt_money(r["price"], 2), fmt_money(r["value"]),
+                    fmt_stake(r.get("stake")), r["cluster"], "Yes" if r.get("plan") else "", r["link"])
+
+        def _tags(self, r: dict) -> tuple:
+            if r["code"] == "P" and r["cluster"] >= 2 and not r.get("plan"):
+                return ("hot",)
+            return (r["side"],)
+
+        def _insert(self, r: dict):
+            r["cluster"] = self._cluster_count(r)
+            iid = self.tree.insert("", "end", values=self._values(r), tags=self._tags(r))
+            self.rows[iid] = r
+            self.order.append(iid)
+            self.by_cluster.setdefault(r["cluster_key"], []).append(iid)
+            if not self._visible(r):
+                self.tree.detach(iid)
+
+        def _refresh_row(self, iid: str):
+            r = self.rows[iid]
+            r["cluster"] = self._cluster_count(r)
+            r["cluster_disc"] = self.clusters.get(r["cluster_key"], (1, 1))[1]
+            self.tree.item(iid, values=self._values(r), tags=self._tags(r))
+
+        def _visible(self, r: dict) -> bool:
+            if self.only_ticker and r["ticker"] != self.only_ticker:
+                return False
+            if self.excl_plan_var.get() and r.get("plan"):
+                return False
+            if self.cluster_only_var.get() and r["cluster"] < self._cluster_min():
+                return False
+            try:
+                min_stake = float(self.min_stake_var.get() or 0)
+            except ValueError:
+                min_stake = 0
+            if min_stake > 0 and r["code"] == "P":
+                stake = r.get("stake")
+                if stake is None or stake < min_stake:
+                    return False
+            return True
+
+        def _view_changed(self):
+            for iid in self.rows:
+                self._refresh_row(iid)
+            self._schedule_view()
+
+        def _schedule_view(self):
+            if self._view_job is None:
+                self._view_job = self.root.after(150, self._apply_view)
+
+        def _apply_view(self):
+            self._view_job = None
+            attached = self.tree.get_children()
+            if attached:
+                self.tree.detach(*attached)
+            idx = 0
+            for iid in self.order:
+                if self._visible(self.rows[iid]):
+                    self.tree.move(iid, "", idx)
+                    idx += 1
+            self._update_summary()
+
+        def _visible_rows(self) -> list[dict]:
+            return [self.rows[i] for i in self.tree.get_children()]
+
+        def _update_summary(self):
+            vis = self._visible_rows()
+            total = len(self.rows)
+            if not total:
+                self.summary_var.set("No matching trades yet.")
+                return
+            buys = [r for r in vis if r["code"] == "P"]
+            sells = [r for r in vis if r["code"] == "S"]
+            clusters = {r["ticker"] for r in buys if r["cluster"] >= 2}
+            txt = f"Showing {len(vis):,} of {total:,} trades"
+            txt += (f"   •   Buys: {len(buys):,} ({fmt_compact(sum(r['value'] for r in buys))})"
+                    f"   •   Sells: {len(sells):,} ({fmt_compact(sum(r['value'] for r in sells))})"
+                    f"   •   Cluster-buy tickers: {len(clusters):,}")
+            if self.only_ticker:
+                txt += f"   •   Filtered to {self.only_ticker}"
+            self.summary_var.set(txt)
+
+        def clear_results(self):
+            self.tree.delete(*self.tree.get_children())
+            for iid in list(self.rows):
+                if self.tree.exists(iid):
+                    self.tree.delete(iid)
+            self.rows.clear()
+            self.order.clear()
+            self.clusters.clear()
+            self.by_cluster.clear()
+            self.only_ticker = None
+            self.sort_key, self.sort_desc = None, False
+            for key, head, *_ in COLUMNS:
+                self.tree.heading(key, text=head)
+            self._update_summary()
+
+        # ---- sorting -------------------------------------------------------
+        def sort_by(self, key: str):
+            numeric = next(c[4] for c in COLUMNS if c[0] == key)
+            if self.sort_key == key:
+                self.sort_desc = not self.sort_desc
+            else:
+                self.sort_key, self.sort_desc = key, numeric   # numbers default high-to-low
+            if numeric:
+                def kf(iid):
+                    v = self.rows[iid].get(key)
+                    return (-INF if v is None else v, self.rows[iid]["value"])
+            elif key == "plan":
+                kf = lambda iid: (bool(self.rows[iid].get("plan")), self.rows[iid]["value"])
+            else:
+                kf = lambda iid: (str(self.rows[iid][key]).lower(), -self.rows[iid]["value"])
+            self.order.sort(key=kf, reverse=self.sort_desc)
+            for k in HEADINGS:
+                arrow = (" ▼" if self.sort_desc else " ▲") if k == key else ""
+                self.tree.heading(k, text=HEADINGS[k] + arrow)
+            self._apply_view()
+
+        # ---- row actions ---------------------------------------------------
+        def _on_double(self, event):
+            if self.tree.identify_region(event.x, event.y) not in ("cell", "tree"):
+                return
+            iid = self.tree.identify_row(event.y)
+            if iid:
+                webbrowser.open(self.rows[iid]["link"])
+
+        def _on_right_click(self, event):
+            iid = self.tree.identify_row(event.y)
+            if iid:
+                if iid not in self.tree.selection():
+                    self.tree.selection_set(iid)
+                self.ctx.tk_popup(event.x_root, event.y_root)
+
+        def filter_to_ticker(self):
+            sel = self.tree.selection()
+            if sel:
+                self.only_ticker = self.rows[sel[0]]["ticker"]
+                self._apply_view()
+
+        def clear_ticker_filter(self):
+            self.only_ticker = None
+            self._apply_view()
+
+        def open_selected(self, index: bool = False):
+            for iid in self.tree.selection()[:10]:
+                webbrowser.open(self.rows[iid]["index_link" if index else "link"])
+
+        def copy_link(self):
+            sel = self.tree.selection()
+            if sel:
+                self.root.clipboard_clear()
+                self.root.clipboard_append("\n".join(self.rows[i]["link"] for i in sel))
+
+        def copy_selected(self):
+            sel = self.tree.selection()
+            if not sel:
+                return
+            lines = ["\t".join(CSV_HEADERS)]
+            lines += ["\t".join(str(x) for x in row_to_csv(self.rows[i])) for i in sel]
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(lines))
+
+        def export_csv(self):
+            vis = self.tree.get_children()
+            if not vis:
+                messagebox.showinfo(APP_NAME, "There are no results to export yet.")
+                return
+            path = filedialog.asksaveasfilename(
+                title="Export results", defaultextension=".csv",
+                initialfile=f"form4_insider_trades_{dt.date.today():%Y%m%d}.csv",
+                filetypes=[("CSV (Excel)", "*.csv"), ("All files", "*.*")])
+            if not path:
+                return
+            try:
+                with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+                    w = csv.writer(fh)
+                    w.writerow(CSV_HEADERS)
+                    for iid in vis:
+                        w.writerow(row_to_csv(self.rows[iid]))
+            except OSError as exc:
+                messagebox.showerror(APP_NAME, f"Could not write file:\n{exc}")
+                return
+            self.status_var.set(f"Exported {len(vis):,} rows to {path}")
+            if messagebox.askyesno(APP_NAME, f"Exported {len(vis):,} rows (the ones currently shown).\n\nOpen the file now?"):
+                try:
+                    os.startfile(path)  # type: ignore[attr-defined]
+                except Exception:
+                    webbrowser.open("file:///" + path.replace("\\", "/"))
+
+        # ---- misc ------------------------------------------------------------
+        def open_data_folder(self):
+            path = app_data_dir()
+            try:
+                os.startfile(path)  # type: ignore[attr-defined]
+            except Exception:
+                messagebox.showinfo(APP_NAME, path)
+
+        def clear_cache(self):
+            if self.worker and self.worker.is_alive():
+                messagebox.showinfo(APP_NAME, "Please wait for the current scan to finish or cancel it first.")
+                return
+            if messagebox.askyesno(APP_NAME, "Delete all downloaded/cached filings? The next scan will re-download them."):
+                try:
+                    Cache.clear_all()
+                    self.status_var.set("Cache cleared.")
+                except Exception as exc:
+                    messagebox.showerror(APP_NAME, str(exc))
+
+        def show_help(self):
+            messagebox.showinfo(APP_NAME, (
+                f"{APP_NAME} v{APP_VERSION}\n\n"
+                "Market-wide: reads EDGAR's daily index of every Form 4 filed on each weekday in the range "
+                "(plus EDGAR's latest-filings feed for today), then downloads and parses each filing.\n\n"
+                "Watchlist: looks up each ticker's CIK and lists only that company's Form 4 filings.\n\n"
+                "Values = shares x price for common-stock (non-derivative) transactions. With 'Combine lots' "
+                "on, all lots of the same code in one filing become one row with a weighted-average price.\n\n"
+                "Requests are limited to 8/second per SEC policy. Parsed filings are cached, so re-scans "
+                "with different filters are fast.\n\nData folder:\n" + app_data_dir()))
+
+        def show_signal_help(self):
+            messagebox.showinfo(APP_NAME, (
+                "Finding true insider buying\n\n"
+                "• Cluster = how many DIFFERENT insiders made the same kind of trade (e.g. open-market "
+                "buys) in that company during the scanned dates - counted across all sizes and roles, not just "
+                "the rows shown. Several insiders buying together is a stronger signal than one.\n\n"
+                "• Stake Δ % = how much the trade grew the insider's holding, from the 'shares owned "
+                "following transaction' on the Form 4. 'New' = their first shares.\n\n"
+                "• 10b5-1 = the trade was made under a pre-scheduled trading plan (the Form 4 checkbox, or "
+                "a footnote saying so). Planned trades say less about the insider's current view.\n\n"
+                "The ★ preset sets: open-market buys only, ≥ $100k, last 30 days, all roles, "
+                "≥ 2 insiders, no 10b5-1 plans, stake +10% or more.\n\n"
+                "This is a research filter, not investment advice."))
+
+        def on_close(self):
+            try:
+                self._save()
+            except Exception:
+                pass
+            if self.cancel_event:
+                self.cancel_event.set()
+            self.root.destroy()
+
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
+
+
+# ============================================================================
+# CLI (handy for scripting / troubleshooting)
+# ============================================================================
+def apply_signal_filters(rows: list, clusters: dict, exclude_plan: bool, min_cluster: int,
+                         min_stake: float) -> list:
+    """Same logic as the GUI's instant filters (used by the CLI and tests)."""
+    out = []
+    for r in rows:
+        all_n, disc_n = clusters.get(r["cluster_key"], (1, 0 if r.get("plan") else 1))
+        r["cluster"], r["cluster_disc"] = (disc_n if exclude_plan else all_n), disc_n
+        if exclude_plan and r.get("plan"):
+            continue
+        if min_cluster and r["cluster"] < min_cluster:
+            continue
+        if min_stake > 0 and r["code"] == "P":
+            if r.get("stake") is None or r["stake"] < min_stake:
+                continue
+        out.append(r)
+    return out
+
+
+def run_cli(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="form4_scanner.py --cli", description="Scan SEC Form 4 filings from the command line.")
+    ap.add_argument("--ua", required=True, help='SEC contact, e.g. "Jane Doe jane@example.com"')
+    ap.add_argument("--days", type=int, default=7)
+    ap.add_argument("--start")
+    ap.add_argument("--end")
+    ap.add_argument("--tickers", default="")
+    ap.add_argument("--roles", default="", help="comma list of: ceo,cfo,legal,director")
+    ap.add_argument("--codes", default="P", help="comma list of P,S,A,M")
+    ap.add_argument("--min", type=float, default=50000)
+    ap.add_argument("--amendments", action="store_true")
+    ap.add_argument("--no-combine", action="store_true")
+    ap.add_argument("--exclude-plan", action="store_true", help="drop 10b5-1 plan trades")
+    ap.add_argument("--clusters", type=int, default=0, help="only show trades with >= N different insiders")
+    ap.add_argument("--min-stake", type=float, default=0, help="buys must grow the holding by >= this %%")
+    ap.add_argument("--csv", help="write results to this CSV file")
+    a = ap.parse_args(argv)
+
+    end = dt.date.fromisoformat(a.end) if a.end else dt.date.today()
+    start = dt.date.fromisoformat(a.start) if a.start else end - dt.timedelta(days=a.days)
+    role_map = {"ceo": ROLE_CEO, "cfo": ROLE_CFO, "legal": ROLE_LEGAL, "director": ROLE_DIR}
+    params = ScanParams(start=start, end=end, user_agent=a.ua, tickers=parse_tickers(a.tickers),
+                        roles={role_map[r.strip().lower()] for r in a.roles.split(",") if r.strip()},
+                        codes={c.strip().upper() for c in a.codes.split(",") if c.strip()},
+                        min_value=a.min, include_amendments=a.amendments, combine_lots=not a.no_combine)
+    q: queue.Queue = queue.Queue()
+    cancel = threading.Event()
+    t = threading.Thread(target=Scanner(params, q, cancel).run, daemon=True)
+    t.start()
+    rows, last_print, clusters = [], 0.0, {}
+    try:
+        while True:
+            try:
+                _sid, kind, payload = q.get(timeout=0.5)
+            except queue.Empty:
+                if not t.is_alive():
+                    break
+                continue
+            if kind == "rows":
+                rows.extend(payload)
+            elif kind == "clusters":
+                clusters.update(payload)
+            elif kind in ("phase", "warn"):
+                print(f"[{kind}] {payload}", file=sys.stderr)
+            elif kind == "progress" and time.time() - last_print > 2:
+                last_print = time.time()
+                print(f"  scanned {payload['done']}/{payload['total']}  matches {payload['matched']}", file=sys.stderr)
+            elif kind in ("done", "cancelled"):
+                print(f"[{kind}] {payload}", file=sys.stderr)
+                break
+            elif kind == "error":
+                print(f"[error] {payload}", file=sys.stderr)
+                return 1
+    except KeyboardInterrupt:
+        cancel.set()
+    rows = apply_signal_filters(rows, clusters, a.exclude_plan, a.clusters, a.min_stake)
+    rows.sort(key=lambda r: (r["filing_date"], r["value"]), reverse=True)
+    for r in rows:
+        print(f"{r['filing_date']}  {r['ticker']:<6} {r['side']:<5} {fmt_money(r['value']):>15}  "
+              f"{fmt_stake(r.get('stake')):>9}  cl={r['cluster']:<2} plan={'Y' if r.get('plan') else 'N'}  "
+              f"{r['insider'][:28]:<28} {r['role'][:24]:<24} {r['link']}")
+    if a.csv:
+        with open(a.csv, "w", newline="", encoding="utf-8-sig") as fh:
+            w = csv.writer(fh)
+            w.writerow(CSV_HEADERS)
+            w.writerows(row_to_csv(r) for r in rows)
+        print(f"Wrote {len(rows)} rows to {a.csv}", file=sys.stderr)
+    return 0
+
+
+def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "--cli":
+        sys.exit(run_cli(sys.argv[2:]))
+    run_gui()
+
+
+if __name__ == "__main__":
+    main()
