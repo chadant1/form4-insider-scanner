@@ -39,12 +39,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 APP_NAME = "SEC Form 4 Insider Scanner"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 SEC_WWW = "https://www.sec.gov"
 SEC_DATA = "https://data.sec.gov"
 MAX_REQUESTS_PER_SECOND = 8          # SEC's published limit is 10/sec
 FETCH_WORKERS = 4
+HISTORY_YEARS = 5                    # how far back to look for an insider's earlier buys
 CACHE_VERSION = 2                    # bump if the parsed-record format changes
 
 # ----------------------------------------------------------------------------
@@ -459,6 +460,89 @@ def stake_change_pct(lots: list) -> float | None:
     return (after_total - before_total) / before_total * 100.0
 
 
+def holdings_after(lots: list) -> float | None:
+    """Total shares held (across the traded ownership lines) right after these lots."""
+    lines: dict = {}
+    for x in lots:
+        lines.setdefault((x.get("own") or "D", x.get("nat", "")), []).append(x)
+    total = 0.0
+    for group in lines.values():
+        after = group[-1].get("after")
+        if after is None:
+            return None
+        total += after
+    return total
+
+
+def _years_ago(d: dt.date, years: int) -> dt.date:
+    try:
+        return d.replace(year=d.year - years)
+    except ValueError:                       # Feb 29
+        return d.replace(year=d.year - years, day=28)
+
+
+def _to_date(text: str) -> dt.date | None:
+    try:
+        return dt.date.fromisoformat((text or "")[:10])
+    except ValueError:
+        return None
+
+
+def classify_pattern(trade_date: dt.date, prior_buys: list, years: int = HISTORY_YEARS) -> tuple[str, str]:
+    """Classify a purchase by the insider's earlier open-market buys in the same company.
+
+    routine  - bought around the same time of year (+/-3 weeks) in each of the previous 3 years
+               (Cohen, Malloy & Pomorski's definition of a routine trader, with a small date window)
+    regular  - bought in 3+ of the previous 4 calendar quarters, or same time of year in 2 of 3 years
+    first    - no earlier open-market buys in the look-back window
+    opp      - has bought before, but not on a schedule ("opportunistic")
+    Buys within 30 days before this one are treated as part of the same buying spree.
+    """
+    cutoff = trade_date - dt.timedelta(days=30)
+    prior = sorted(d for d in prior_buys if d and d < cutoff)
+    if not prior:
+        return "first", f"First buy in {years}+ yrs"
+    hits = [k for k in (1, 2, 3)
+            if any(abs((d - _years_ago(trade_date, k)).days) <= 21 for d in prior)]
+    if len(hits) == 3:
+        return "routine", f"Routine (yearly since {trade_date.year - 3})"
+
+    def qtr(d: dt.date) -> int:
+        return d.year * 4 + (d.month - 1) // 3
+    cq = qtr(trade_date)
+    quarters = {qtr(d) for d in prior if cq - 4 <= qtr(d) < cq}
+    if len(quarters) >= 3:
+        return "regular", f"Regular ({len(quarters)} of last 4 qtrs)"
+    if len(hits) == 2:
+        return "regular", "Regular (2 of last 3 yrs)"
+    return "opp", f"Opportunistic (last {prior[-1]:%b %Y})"
+
+
+def classify_later_sales(trade_start: dt.date, records: list, held_after: float | None) -> tuple[str, str, float | None]:
+    """Did the insider sell (Code S) on or after the purchase date? Tax withholding (F) is reported separately."""
+    sold, tax, first = 0.0, 0.0, None
+    for rec in records:
+        for t in rec.get("txns", []):
+            if t.get("t") != "N":
+                continue
+            d = _to_date(t.get("date", "")) or _to_date(rec.get("filing_date", ""))
+            if not d or d < trade_start:
+                continue
+            if t.get("code") == "S":
+                sold += t.get("sh") or 0.0
+                first = d if first is None else min(first, d)
+            elif t.get("code") == "F":
+                tax += t.get("sh") or 0.0
+    if sold > 0:
+        if held_after and held_after > 0:
+            pct = min(100.0, sold / held_after * 100.0)
+            return "sold", f"Sold {pct:.0f}% ({first:%b %d})", pct
+        return "sold", f"Sold {sold:,.0f} sh ({first:%b %d})", None
+    if tax > 0:
+        return "tax", "No (tax w/h only)", 0.0
+    return "none", "No", 0.0
+
+
 def fmt_stake(pct: float | None) -> str:
     if pct is None:
         return ""
@@ -499,6 +583,7 @@ class ScanParams:
     min_value: float = 50000.0
     include_amendments: bool = False
     combine_lots: bool = True
+    check_history: bool = True                      # pattern + later-sales lookup for buyers
 
 
 def cluster_key(record: dict, code: str) -> str:
@@ -579,6 +664,15 @@ def evaluate_record(record: dict, cand: dict, params: ScanParams) -> list[dict]:
                 "cluster_key": cluster_key(record, code),
                 "cluster": 1,
                 "cluster_disc": 0 if plan else 1,
+                "owner_cik": record["owners"][0].get("cik", ""),
+                "issuer_cik": record.get("issuer_cik", "") or cand.get("issuer_cik") or "",
+                "trade_start": dates[0] if dates else (record.get("filing_date") or ""),
+                "held_after": holdings_after(chunk),
+                "pattern": "\u2026" if (code == "P" and params.check_history) else "",
+                "pattern_kind": "pending" if (code == "P" and params.check_history) else "na",
+                "sold": "\u2026" if (code == "P" and params.check_history) else "",
+                "sold_kind": "pending" if (code == "P" and params.check_history) else "na",
+                "sold_pct": None,
             })
     return rows
 
@@ -638,6 +732,7 @@ class Scanner:
         # cluster_key -> {"all": set(insiders), "disc": set(insiders not trading under a 10b5-1 plan)}
         self.clusters: dict[str, dict] = {}
         self._changed: set = set()
+        self.buys: dict[str, dict] = {}       # accession -> purchase info for the history check
 
     def post(self, kind: str, payload=None) -> None:
         self.q.put((self.scan_id, kind, payload))
@@ -762,6 +857,150 @@ class Scanner:
                 self.post("warn", f"Could not read EDGAR latest-filings feed: {exc}")
         return cands
 
+    def _emit(self, rows: list) -> None:
+        self.post("rows", rows)
+        for r in rows:
+            if r["code"] != "P":
+                continue
+            b = self.buys.get(r["acc"])
+            if b is None:
+                self.buys[r["acc"]] = {k: r[k] for k in ("owner_cik", "issuer_cik", "trade_start",
+                                                          "filing_date", "held_after", "value")}
+            else:
+                b["trade_start"] = min(b["trade_start"], r["trade_start"])
+                b["value"] += r["value"]
+                if r["held_after"] is not None:
+                    b["held_after"] = max(b["held_after"] or 0.0, r["held_after"])
+
+    # -- insider history: buying pattern + later sales -------------------------
+    @staticmethod
+    def _form4_list_task(client: SecClient, cik: int, since: str) -> dict:
+        """{accession: filing date} of every Form 4 listed under a CIK since a date."""
+        out: dict = {}
+
+        def add(block: dict) -> None:
+            for acc, fdate, form in zip(block.get("accessionNumber", []), block.get("filingDate", []),
+                                        block.get("form", [])):
+                if form == "4" and fdate >= since:
+                    out[acc] = fdate
+        data = json.loads(client.get(f"{SEC_DATA}/submissions/CIK{cik:010d}.json"))
+        filings = data.get("filings", {})
+        recent = filings.get("recent", {})
+        add(recent)
+        dates = recent.get("filingDate", [])
+        if dates and min(dates) > since:
+            for f in filings.get("files", []):
+                if f.get("filingTo", "") >= since:
+                    add(json.loads(client.get(f"{SEC_DATA}/submissions/{f['name']}")))
+        return out
+
+    @staticmethod
+    def _unknown(reason: str = "Unavailable") -> dict:
+        return {"pattern": reason, "pattern_kind": "unknown", "sold": reason, "sold_kind": "unknown", "sold_pct": None}
+
+    def _classify(self, acc: str, buy: dict, accs: set | None, cache: Cache, owner: str, issuer: str) -> dict:
+        trade = _to_date(buy["trade_start"]) or _to_date(buy["filing_date"])
+        if accs is None or trade is None:
+            return self._unknown()
+        prior, records = [], []
+        for a in accs:
+            rec = cache.get_filing(a)
+            if not rec or rec.get("error"):
+                continue
+            if rec.get("issuer_cik") and str(rec["issuer_cik"]) != str(issuer):
+                continue
+            if not any(o.get("cik") == owner for o in rec.get("owners", [])):
+                continue
+            records.append(rec)
+            if a == acc:
+                continue
+            for t in rec.get("txns", []):
+                if t.get("t") == "N" and t.get("code") == "P":
+                    d = _to_date(t.get("date", ""))
+                    if d and d < trade:
+                        prior.append(d)
+        p_kind, p_label = classify_pattern(trade, prior)
+        s_kind, s_label, s_pct = classify_later_sales(trade, records, buy.get("held_after"))
+        return {"pattern": p_label, "pattern_kind": p_kind, "sold": s_label, "sold_kind": s_kind, "sold_pct": s_pct}
+
+    def history_phase(self, client: SecClient, cache: Cache) -> None:
+        since = (_years_ago(dt.date.today(), HISTORY_YEARS) - dt.timedelta(days=120)).isoformat()
+        pairs: dict[tuple, list] = {}
+        for acc, b in self.buys.items():
+            if b["owner_cik"] and b["issuer_cik"]:
+                pairs.setdefault((b["owner_cik"], str(b["issuer_cik"])), []).append(acc)
+            else:
+                self.post("history", {acc: self._unknown()})
+        order = sorted(pairs, key=lambda k: -max(self.buys[a]["value"] for a in pairs[k]))
+        total, done = len(order), 0
+        if not total:
+            return
+        self.post("phase", f"Checking buying history & later sales for {total:,} insiders...")
+        self.post("history_progress", (0, total))
+        lists: dict[str, dict | None] = {}
+        ex = ThreadPoolExecutor(max_workers=FETCH_WORKERS)
+
+        def collect(futures: dict, on_ok, on_fail) -> None:
+            for fut in as_completed(futures):
+                key = futures[fut]
+                try:
+                    on_ok(key, fut.result())
+                except Cancelled:
+                    raise
+                except SecAccessDenied as exc:
+                    if "User-Agent" in str(exc):
+                        raise
+                    on_fail(key)
+                except Exception:
+                    on_fail(key)
+            self.check_cancel()
+
+        try:
+            for i in range(0, total, 20):
+                batch = order[i:i + 20]
+                # 1) Form 4 lists for each insider and company (cached for 6 hours)
+                futs = {}
+                for cik in {c for pair in batch for c in pair if c not in lists}:
+                    raw = cache.get_blob(f"f4list:{cik}", max_age=6 * 3600)
+                    if raw is not None:
+                        lists[cik] = json.loads(raw)
+                    else:
+                        futs[ex.submit(self._form4_list_task, client, int(cik), since)] = cik
+
+                def got_list(cik, data):
+                    lists[cik] = data
+                    cache.put_blob(f"f4list:{cik}", json.dumps(data).encode())
+                collect(futs, got_list, lambda cik: lists.__setitem__(cik, None))
+
+                # 2) filings about this insider AND this company = intersection of the two lists
+                pair_accs: dict[tuple, set | None] = {}
+                todo: dict[str, dict] = {}
+                for pair in batch:
+                    o_list, i_list = lists.get(pair[0]), lists.get(pair[1])
+                    if o_list is None or i_list is None:
+                        pair_accs[pair] = None
+                        continue
+                    accs = (set(o_list) & set(i_list)) | set(pairs[pair])
+                    pair_accs[pair] = accs
+                    for a in accs:
+                        if a not in todo and cache.get_filing(a) is None:
+                            todo[a] = {"acc": a, "date": o_list.get(a) or i_list.get(a) or "",
+                                       "path": f"edgar/data/{pair[1]}/{a.replace('-', '')}/{a}.txt"}
+                futs = {ex.submit(self._fetch_one, client, c): a for a, c in todo.items()}
+                collect(futs, lambda a, rec: cache.put_filing(a, rec), lambda a: None)
+
+                # 3) classify and send to the window
+                results = {}
+                for pair in batch:
+                    for acc in pairs[pair]:
+                        results[acc] = self._classify(acc, self.buys[acc], pair_accs[pair], cache, pair[0], pair[1])
+                    done += 1
+                cache.flush()
+                self.post("history", results)
+                self.post("history_progress", (done, total))
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+
     # -- clusters ------------------------------------------------------------
     def track(self, rec: dict, cand: dict) -> None:
         """Record which insiders traded each issuer, by code (any size / role)."""
@@ -824,7 +1063,7 @@ class Scanner:
                 rows = evaluate_record(rec, cand, self.p)
                 if rows:
                     stats["matched"] += len(rows)
-                    self.post("rows", rows)
+                    self._emit(rows)
                 if stats["done"] % 250 == 0:
                     self.flush_clusters()
                     self.post("progress", dict(stats))
@@ -859,7 +1098,7 @@ class Scanner:
                             rows = evaluate_record(rec, cand, self.p)
                             if rows:
                                 stats["matched"] += len(rows)
-                                self.post("rows", rows)
+                                self._emit(rows)
                         stats["done"] += 1
                         if stats["done"] % 25 == 0:
                             self.flush_clusters()
@@ -868,6 +1107,8 @@ class Scanner:
                 finally:
                     ex.shutdown(wait=False, cancel_futures=True)
             self.flush_clusters(force=True)
+            if self.p.check_history and self.buys:
+                self.history_phase(client, cache)
             stats["requests"] = client.request_count
             self.post("done", stats)
         except Cancelled:
@@ -912,7 +1153,8 @@ def fmt_compact(v: float) -> str:
 
 CSV_HEADERS = ["Filing Date", "Ticker", "Company", "Insider Name", "Matched Role", "Exact Title",
                "Buy/Sell", "Transaction Code", "Shares", "Price", "Total Value ($)", "Stake Change %",
-               "Cluster (insiders)", "Cluster excl. 10b5-1", "10b5-1 Plan", "Trade Date(s)",
+               "Cluster (insiders)", "Cluster excl. 10b5-1", "10b5-1 Plan", "Pattern", "Sold Since",
+               "Sold % of Holding", "Trade Date(s)",
                "Lots", "Form", "Accession", "SEC Link", "Filing Index"]
 
 
@@ -922,6 +1164,8 @@ def row_to_csv(r: dict) -> list:
     return [r["filing_date"], r["ticker"], r["company"], r["insider"], r["role"], r["title"],
             r["side"], r["code"], round(r["shares"], 4), round(r["price"], 4), round(r["value"], 2),
             stake_out, r.get("cluster", 1), r.get("cluster_disc", 1), "Yes" if r.get("plan") else "No",
+            r.get("pattern", ""), r.get("sold", ""),
+            "" if r.get("sold_pct") is None else round(r["sold_pct"], 1),
             r["trade_dates"], r["lots"], r["form"], r["acc"], r["link"], r["index_link"]]
 
 
@@ -951,25 +1195,33 @@ def run_gui() -> None:
         # key, heading, width, anchor, numeric
         ("filing_date", "Filing Date", 100, "w", False),
         ("ticker", "Ticker", 64, "w", False),
-        ("company", "Company", 170, "w", False),
-        ("insider", "Insider Name", 160, "w", False),
-        ("role", "Matched Role", 140, "w", False),
-        ("title", "Exact Title", 165, "w", False),
+        ("company", "Company", 150, "w", False),
+        ("insider", "Insider Name", 150, "w", False),
+        ("role", "Matched Role", 120, "w", False),
+        ("title", "Exact Title", 140, "w", False),
         ("side", "Buy/Sell", 80, "center", False),
-        ("shares", "Shares", 90, "e", True),
-        ("price", "Price", 80, "e", True),
+        ("shares", "Shares", 84, "e", True),
+        ("price", "Price", 76, "e", True),
         ("value", "Total Value ($)", 128, "e", True),
-        ("stake", "Stake Δ %", 96, "e", True),
-        ("cluster", "Cluster", 72, "center", True),
-        ("plan", "10b5-1", 72, "center", False),
-        ("link", "SEC Link", 330, "w", False),
+        ("stake", "Stake Δ %", 88, "e", True),
+        ("cluster", "Cluster", 66, "center", True),
+        ("plan", "10b5-1", 62, "center", False),
+        ("pattern", "Pattern", 215, "w", False),
+        ("sold", "Sold Since", 145, "w", False),
+        ("link", "SEC Link", 260, "w", False),
     ]
     HEADINGS = {c[0]: c[1] for c in COLUMNS}
     TOOLTIPS = {
         "stake": "How much this trade grew (or shrank) the insider's holding. 'New' = first shares.",
         "cluster": "Number of different insiders making the same kind of trade in this company during the scanned dates.",
         "plan": "Yes = made under a pre-scheduled Rule 10b5-1 trading plan (less informative).",
+        "pattern": "The insider's earlier open-market buys in this company (last 5 years): First buy, "
+                   "Opportunistic (no schedule), Regular (most recent quarters / 2 of 3 years) or "
+                   "Routine (same time every year for 3 years).",
+        "sold": "Open-market sales (Code S) by this insider in this company on or after the purchase date, "
+                "as a % of what they held right after buying. Tax withholding on vesting is not counted as a sale.",
     }
+    PATTERN_ORDER = {"first": 0, "opp": 1, "regular": 2, "routine": 3, "unknown": 4, "pending": 5, "na": 6}
 
     class App:
         def __init__(self, root: tk.Tk):
@@ -983,12 +1235,18 @@ def run_gui() -> None:
             self.order: list[str] = []            # all iids in current sort order
             self.clusters: dict[str, tuple] = {}  # cluster_key -> (all, discretionary)
             self.by_cluster: dict[str, list] = {} # cluster_key -> [iid]
+            self.by_acc: dict[str, list] = {}     # accession -> [iid] (buy rows, for history updates)
             self.sort_key, self.sort_desc = None, False
             self.scan_started = 0.0
             self._view_job = None
 
             root.title(APP_NAME)
             root.geometry("1500x900")
+            if sys.platform == "win32":
+                try:
+                    root.state("zoomed")
+                except tk.TclError:
+                    pass
             root.minsize(1100, 660)
             try:
                 ico = resource_path(os.path.join("assets", "app.ico"))
@@ -1133,8 +1391,10 @@ def run_gui() -> None:
             ttk.Checkbutton(sub, text="Combine lots per filing", variable=self.combine_var).pack(side="left")
 
             # Signal filters (instant, no re-scan) --------------------------
-            f = ttk.LabelFrame(grid, text="Signal Filters  (apply instantly to the results - no re-scan needed)", padding=(10, 6))
-            f.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=3)
+            box = ttk.LabelFrame(grid, text="Signal Filters  (apply instantly to the results - no re-scan needed)", padding=(10, 6))
+            box.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=3)
+            f = ttk.Frame(box)
+            f.pack(fill="x")
             self.excl_plan_var = tk.BooleanVar(value=st.get("exclude_plan", True))
             ttk.Checkbutton(f, text="Exclude pre-planned 10b5-1 trades", variable=self.excl_plan_var,
                             command=self._view_changed).pack(side="left", padx=(0, 22))
@@ -1153,6 +1413,20 @@ def run_gui() -> None:
             e.bind("<KeyRelease>", lambda ev: self._view_changed())
             ttk.Label(f, text="%  (0 = off; buys only)").pack(side="left")
             self.cluster_min_var.trace_add("write", lambda *a: self._view_changed())
+
+            f2 = ttk.Frame(box)
+            f2.pack(fill="x", pady=(4, 0))
+            self.history_var = tk.BooleanVar(value=st.get("check_history", True))
+            ttk.Checkbutton(f2, text="Check buyers' history during scan (Pattern + Sold Since)",
+                            variable=self.history_var).pack(side="left", padx=(0, 22))
+            self.hide_routine_var = tk.BooleanVar(value=st.get("hide_routine", False))
+            ttk.Checkbutton(f2, text="Hide routine / regular buyers", variable=self.hide_routine_var,
+                            command=self._view_changed).pack(side="left", padx=(0, 22))
+            self.hide_sold_var = tk.BooleanVar(value=st.get("hide_sold", False))
+            ttk.Checkbutton(f2, text="Hide buyers who have sold since", variable=self.hide_sold_var,
+                            command=self._view_changed).pack(side="left", padx=(0, 22))
+            ttk.Label(f2, text="History check adds ~1 request per filing it needs; results are cached.",
+                      style="Hint.TLabel").pack(side="left")
 
             # SEC contact ---------------------------------------------------
             f = ttk.Frame(outer)
@@ -1208,9 +1482,12 @@ def run_gui() -> None:
             self.cluster_only_var.set(True)
             self.cluster_min_var.set(2)
             self.min_stake_var.set("10")
+            self.history_var.set(True)
+            self.hide_routine_var.set(True)
+            self.hide_sold_var.set(True)
             self._view_changed()
-            self.status_var.set("Preset applied: open-market buys ≥ $100k, 30 days, ≥ 2 insiders, "
-                                "no 10b5-1 plans, stake +10%. Click Start Scan.")
+            self.status_var.set("Preset applied: open-market buys ≥ $100k, 30 days, ≥ 2 insiders, no 10b5-1 "
+                                "plans, stake +10%, no routine buyers, no later sellers. Click Start Scan.")
 
         # ---- table ------------------------------------------------------
         def _table(self):
@@ -1235,6 +1512,8 @@ def run_gui() -> None:
             self.tree.tag_configure("Grant", background="#eef2fb")
             self.tree.tag_configure("Exercise", background="#f6f1e7")
             self.tree.tag_configure("hot", background="#c4ecd1", foreground="#0b3d20", font=self.bold_font)
+            self.tree.tag_configure("flip", background="#fdebd3", foreground="#8a4b08")
+            self.tree.tag_configure("routine", background="#eeeeee", foreground="#5f6670")
             self.tree.bind("<Double-1>", self._on_double)
             self.tree.bind("<Return>", lambda e: self.open_selected())
             self.tree.bind("<Button-3>", self._on_right_click)
@@ -1259,8 +1538,8 @@ def run_gui() -> None:
             f.pack(fill="x")
             self.summary_var = tk.StringVar(value="No results yet.")
             ttk.Label(f, textvariable=self.summary_var).pack(side="left")
-            ttk.Label(f, text="Bold green = cluster buy  •  Double-click a row to open the filing  •  "
-                             "Click a header to sort  •  Right-click for more",
+            ttk.Label(f, text="Bold green = cluster buy  •  Orange = sold since  •  Grey = routine  •  "
+                             "Double-click = open filing",
                       style="Hint.TLabel").pack(side="right")
 
         # header tooltips ---------------------------------------------------
@@ -1324,6 +1603,7 @@ def run_gui() -> None:
                 codes=codes, min_value=min_value,
                 include_amendments=self.amend_var.get(),
                 combine_lots=self.combine_var.get(),
+                check_history=self.history_var.get(),
             )
 
         def _save(self):
@@ -1336,6 +1616,8 @@ def run_gui() -> None:
                 "combine": self.combine_var.get(), "user_agent": self.ua_var.get().strip(),
                 "exclude_plan": self.excl_plan_var.get(), "clusters_only": self.cluster_only_var.get(),
                 "cluster_min": self._cluster_min(), "min_stake": self.min_stake_var.get(),
+                "check_history": self.history_var.get(), "hide_routine": self.hide_routine_var.get(),
+                "hide_sold": self.hide_sold_var.get(),
             })
 
         # ---- scan control -------------------------------------------------
@@ -1416,6 +1698,17 @@ def run_gui() -> None:
                 for r in payload:
                     self._insert(r)
                 self._update_summary()
+            elif kind == "history":
+                for acc, info in payload.items():
+                    for iid in self.by_acc.get(acc, []):
+                        self.rows[iid].update(info)
+                        self._refresh_row(iid)
+                if self.hide_routine_var.get() or self.hide_sold_var.get():
+                    self._schedule_view()
+            elif kind == "history_progress":
+                done, total = payload
+                self.progress.config(mode="determinate", maximum=max(1, total), value=done)
+                self.status_var.set(f"Checking buyers' history & later sales: {done:,} of {total:,} insiders...")
             elif kind == "clusters":
                 self.clusters.update(payload)
                 for key in payload:
@@ -1424,6 +1717,12 @@ def run_gui() -> None:
                 if self.cluster_only_var.get():
                     self._schedule_view()
             elif kind in ("done", "cancelled"):
+                for r in self.rows.values():          # anything the history check didn't reach
+                    if r.get("pattern_kind") == "pending":
+                        r.update({"pattern": "Not checked", "pattern_kind": "unknown",
+                                  "sold": "Not checked", "sold_kind": "unknown"})
+                for iid in self.rows:
+                    self._refresh_row(iid)
                 secs = time.time() - self.scan_started
                 verb = "Scan complete" if kind == "done" else "Scan cancelled"
                 extra = f"  •  {payload['failed']} could not be downloaded" if payload["failed"] else ""
@@ -1432,7 +1731,7 @@ def run_gui() -> None:
                 else:
                     self.status_var.set(f"{verb}: {payload['done']:,} of {payload['total']:,} filings scanned, "
                                         f"{payload['matched']:,} matches in {secs:,.0f}s{extra}")
-                self._finish(payload["done"])
+                self._finish(int(float(self.progress.cget("maximum"))))
                 self._update_summary()
             elif kind == "error":
                 self.status_var.set("Scan stopped with an error.")
@@ -1454,9 +1753,14 @@ def run_gui() -> None:
         def _values(self, r: dict) -> tuple:
             return (r["filing_date"], r["ticker"], r["company"], r["insider"], r["role"], r["title"],
                     r["side"], f"{r['shares']:,.0f}", fmt_money(r["price"], 2), fmt_money(r["value"]),
-                    fmt_stake(r.get("stake")), r["cluster"], "Yes" if r.get("plan") else "", r["link"])
+                    fmt_stake(r.get("stake")), r["cluster"], "Yes" if r.get("plan") else "",
+                    r.get("pattern", ""), r.get("sold", ""), r["link"])
 
         def _tags(self, r: dict) -> tuple:
+            if r["code"] == "P" and r.get("sold_kind") == "sold":
+                return ("flip",)
+            if r["code"] == "P" and r.get("pattern_kind") in ("routine", "regular"):
+                return ("routine",)
             if r["code"] == "P" and r["cluster"] >= 2 and not r.get("plan"):
                 return ("hot",)
             return (r["side"],)
@@ -1467,6 +1771,8 @@ def run_gui() -> None:
             self.rows[iid] = r
             self.order.append(iid)
             self.by_cluster.setdefault(r["cluster_key"], []).append(iid)
+            if r["code"] == "P":
+                self.by_acc.setdefault(r["acc"], []).append(iid)
             if not self._visible(r):
                 self.tree.detach(iid)
 
@@ -1482,6 +1788,10 @@ def run_gui() -> None:
             if self.excl_plan_var.get() and r.get("plan"):
                 return False
             if self.cluster_only_var.get() and r["cluster"] < self._cluster_min():
+                return False
+            if self.hide_routine_var.get() and r.get("pattern_kind") in ("routine", "regular"):
+                return False
+            if self.hide_sold_var.get() and r.get("sold_kind") == "sold":
                 return False
             try:
                 min_stake = float(self.min_stake_var.get() or 0)
@@ -1543,6 +1853,7 @@ def run_gui() -> None:
             self.order.clear()
             self.clusters.clear()
             self.by_cluster.clear()
+            self.by_acc.clear()
             self.only_ticker = None
             self.sort_key, self.sort_desc = None, False
             for key, head, *_ in COLUMNS:
@@ -1562,6 +1873,14 @@ def run_gui() -> None:
                     return (-INF if v is None else v, self.rows[iid]["value"])
             elif key == "plan":
                 kf = lambda iid: (bool(self.rows[iid].get("plan")), self.rows[iid]["value"])
+            elif key == "pattern":
+                kf = lambda iid: (-PATTERN_ORDER.get(self.rows[iid].get("pattern_kind", "na"), 9), self.rows[iid]["value"])
+            elif key == "sold":
+                def kf(iid):
+                    r = self.rows[iid]
+                    pct = r.get("sold_pct")
+                    rank = {"sold": 2, "tax": 1, "none": 0}.get(r.get("sold_kind"), -1)
+                    return (rank, pct if pct is not None else 0.0, r["value"])
             else:
                 kf = lambda iid: (str(self.rows[iid][key]).lower(), -self.rows[iid]["value"])
             self.order.sort(key=kf, reverse=self.sort_desc)
@@ -1681,8 +2000,16 @@ def run_gui() -> None:
                 "following transaction' on the Form 4. 'New' = their first shares.\n\n"
                 "• 10b5-1 = the trade was made under a pre-scheduled trading plan (the Form 4 checkbox, or "
                 "a footnote saying so). Planned trades say less about the insider's current view.\n\n"
+                "• Pattern = the insider's earlier open-market buys in the same company over the last 5 years. "
+                "Routine = around the same time of year (±3 weeks) in each of the last 3 years; Regular = 3 of "
+                "the last 4 quarters, or the same time in 2 of the last 3 years; First buy = none in 5 years; "
+                "Opportunistic = has bought before, with no schedule.\n\n"
+                "• Sold Since = open-market sales (Code S) in the same company on or after the purchase date, as "
+                "a % of the shares held right after buying. Shares withheld for taxes on vesting (Code F) are "
+                "not counted. Re-scan later to refresh.\n\n"
                 "The ★ preset sets: open-market buys only, ≥ $100k, last 30 days, all roles, "
-                "≥ 2 insiders, no 10b5-1 plans, stake +10% or more.\n\n"
+                "≥ 2 insiders, no 10b5-1 plans, stake +10% or more, and hides routine/regular buyers and "
+                "buyers who have sold since.\n\n"
                 "This is a research filter, not investment advice."))
 
         def on_close(self):
@@ -1703,7 +2030,7 @@ def run_gui() -> None:
 # CLI (handy for scripting / troubleshooting)
 # ============================================================================
 def apply_signal_filters(rows: list, clusters: dict, exclude_plan: bool, min_cluster: int,
-                         min_stake: float) -> list:
+                         min_stake: float, hide_routine: bool = False, hide_sold: bool = False) -> list:
     """Same logic as the GUI's instant filters (used by the CLI and tests)."""
     out = []
     for r in rows:
@@ -1716,6 +2043,10 @@ def apply_signal_filters(rows: list, clusters: dict, exclude_plan: bool, min_clu
         if min_stake > 0 and r["code"] == "P":
             if r.get("stake") is None or r["stake"] < min_stake:
                 continue
+        if hide_routine and r.get("pattern_kind") in ("routine", "regular"):
+            continue
+        if hide_sold and r.get("sold_kind") == "sold":
+            continue
         out.append(r)
     return out
 
@@ -1735,6 +2066,9 @@ def run_cli(argv: list[str]) -> int:
     ap.add_argument("--exclude-plan", action="store_true", help="drop 10b5-1 plan trades")
     ap.add_argument("--clusters", type=int, default=0, help="only show trades with >= N different insiders")
     ap.add_argument("--min-stake", type=float, default=0, help="buys must grow the holding by >= this %%")
+    ap.add_argument("--no-history", action="store_true", help="skip the Pattern / Sold Since lookup")
+    ap.add_argument("--hide-routine", action="store_true", help="drop routine / regular buyers")
+    ap.add_argument("--hide-sold", action="store_true", help="drop buyers who have sold since")
     ap.add_argument("--csv", help="write results to this CSV file")
     a = ap.parse_args(argv)
 
@@ -1744,12 +2078,13 @@ def run_cli(argv: list[str]) -> int:
     params = ScanParams(start=start, end=end, user_agent=a.ua, tickers=parse_tickers(a.tickers),
                         roles={role_map[r.strip().lower()] for r in a.roles.split(",") if r.strip()},
                         codes={c.strip().upper() for c in a.codes.split(",") if c.strip()},
-                        min_value=a.min, include_amendments=a.amendments, combine_lots=not a.no_combine)
+                        min_value=a.min, include_amendments=a.amendments, combine_lots=not a.no_combine,
+                        check_history=not a.no_history)
     q: queue.Queue = queue.Queue()
     cancel = threading.Event()
     t = threading.Thread(target=Scanner(params, q, cancel).run, daemon=True)
     t.start()
-    rows, last_print, clusters = [], 0.0, {}
+    rows, last_print, clusters, history = [], 0.0, {}, {}
     try:
         while True:
             try:
@@ -1762,6 +2097,8 @@ def run_cli(argv: list[str]) -> int:
                 rows.extend(payload)
             elif kind == "clusters":
                 clusters.update(payload)
+            elif kind == "history":
+                history.update(payload)
             elif kind in ("phase", "warn"):
                 print(f"[{kind}] {payload}", file=sys.stderr)
             elif kind == "progress" and time.time() - last_print > 2:
@@ -1775,12 +2112,16 @@ def run_cli(argv: list[str]) -> int:
                 return 1
     except KeyboardInterrupt:
         cancel.set()
-    rows = apply_signal_filters(rows, clusters, a.exclude_plan, a.clusters, a.min_stake)
+    for r in rows:
+        if r["code"] == "P" and r["acc"] in history:
+            r.update(history[r["acc"]])
+    rows = apply_signal_filters(rows, clusters, a.exclude_plan, a.clusters, a.min_stake,
+                                a.hide_routine, a.hide_sold)
     rows.sort(key=lambda r: (r["filing_date"], r["value"]), reverse=True)
     for r in rows:
         print(f"{r['filing_date']}  {r['ticker']:<6} {r['side']:<5} {fmt_money(r['value']):>15}  "
               f"{fmt_stake(r.get('stake')):>9}  cl={r['cluster']:<2} plan={'Y' if r.get('plan') else 'N'}  "
-              f"{r['insider'][:28]:<28} {r['role'][:24]:<24} {r['link']}")
+              f"{r['insider'][:26]:<26} {r.get('pattern', '')[:34]:<34} {r.get('sold', '')[:18]:<18} {r['link']}")
     if a.csv:
         with open(a.csv, "w", newline="", encoding="utf-8-sig") as fh:
             w = csv.writer(fh)

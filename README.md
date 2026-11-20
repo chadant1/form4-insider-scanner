@@ -27,6 +27,8 @@ Click **★ True Insider Buying preset**, then **Start Scan**. The preset sets:
 | Exclude 10b5-1 | On | Pre-scheduled plan trades say little about current views |
 | Clusters only | ≥ 2 different insiders | Several insiders buying together is a stronger signal |
 | Min stake increase | +10% | The buy must meaningfully grow the insider's holding |
+| Hide routine / regular buyers | On | Buys made on a schedule carry little information |
+| Hide buyers who have sold since | On | A quick sale undercuts the signal |
 
 The **Signal Filters** row applies instantly to results you already have, so you can loosen or tighten it without re-scanning.
 
@@ -34,6 +36,15 @@ The **Signal Filters** row applies instantly to results you already have, so you
 * **Stake Δ %** shows how much the trade changed the insider's holding. It is calculated from *shares owned following transaction*, adding direct and each indirect holding (e.g. a trust) separately. **New** means a first-ever position.
 * **Cluster** is the number of *different* insiders who made the same type of trade in that company during the scanned dates. It counts every size and role, not just the rows shown. With *Exclude 10b5-1* on, plan trades don't count toward it. Cluster buys are shown in **bold green**.
 * **10b5-1** shows *Yes* when the filing ticks the Rule 10b5-1 checkbox (added to Form 4 in 2023) or a footnote on the transaction says it was made under a 10b5-1 plan. Footnotes saying "*not* pursuant to a 10b5-1 plan" are ignored.
+
+* **Pattern** describes the insider's earlier open-market buys in the same company over the last 5 years. It is found by matching the insider's Form 4 list against the company's on EDGAR.
+  * *First buy in 5+ yrs*: no earlier purchases.
+  * *Opportunistic*: has bought before, with no schedule.
+  * *Regular*: bought in 3 or more of the last 4 quarters, or around the same time in 2 of the last 3 years.
+  * *Routine*: bought around the same time of year (±3 weeks) in each of the last 3 years. This follows Cohen, Malloy & Pomorski's definition of routine traders, whose trades carried essentially no predictive power.
+  * Buys within 30 days before the current one count as the same buying spree.
+* **Sold Since** shows open-market sales (Code S) by the same insider in the same company on or after the purchase date, as a % of what they held right after buying. Shares withheld for taxes when stock vests (Code F) are labelled *tax w/h only* and are not counted as a sale. Rows where the buyer has since sold are shown in **orange**, and routine or regular buyers in grey. Later sales only appear once filed, so re-scan later to refresh.
+* The history check runs after the main scan, for buy rows only, and takes a few requests per insider. Results are cached, so you can untick *Check buyers' history* for a faster scan.
 
 This is a research filter, not investment advice. Insider buying has historically been followed by modestly positive returns *on average*, and plenty of individual cases lose money.
 
@@ -48,7 +59,7 @@ This is a research filter, not investment advice. Insider buying has historicall
 Requires Python 3.9+ and nothing else (standard library only).
 ```
 python form4_scanner.py                 # GUI
-python form4_scanner.py --cli --ua "Jane Doe jane@example.com" --days 30 --codes P --min 100000 --exclude-plan --clusters 2 --min-stake 10 --csv out.csv
+python form4_scanner.py --cli --ua "Jane Doe jane@example.com" --days 30 --codes P --min 100000 --exclude-plan --clusters 2 --min-stake 10 --hide-routine --hide-sold --csv out.csv
 python tests/test_scanner.py            # offline tests (mocked SEC responses)
 ```
 On Windows you can also double-click `Run_Form4_Scanner.bat`, or `Build_EXE.bat` to build the exe locally.
