@@ -31,6 +31,7 @@ import threading
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 import xml.etree.ElementTree as ET
@@ -39,14 +40,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 APP_NAME = "SEC Form 4 Insider Scanner"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 SEC_WWW = "https://www.sec.gov"
 SEC_DATA = "https://data.sec.gov"
 MAX_REQUESTS_PER_SECOND = 8          # SEC's published limit is 10/sec
 FETCH_WORKERS = 4
 HISTORY_YEARS = 5                    # how far back to look for an insider's earlier buys
-CACHE_VERSION = 2                    # bump if the parsed-record format changes
+CONTEXT_DAYS = 90                    # window for "what other insiders did" and recent 13D filings
+PRICE_RPS = 3                        # Yahoo Finance requests per second
+BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36"
+CACHE_VERSION = 3                    # bump if the parsed-record format changes
 
 # ----------------------------------------------------------------------------
 # Insider-role matching (case-insensitive, on officer title + relationship text)
@@ -305,6 +309,23 @@ def _num(text: str) -> float | None:
         return None
 
 
+# Purchases made in a company offering / private placement rather than on the open market
+OFFERING_RE = re.compile(
+    r"(?:underwritten|registered\s+direct|public|secondary|follow[- ]on|initial\s+public|best[- ]efforts|"
+    r"at[- ]the[- ]market|concurrent)\s+offering|\bIPO\b|private\s+placement|rights\s+offering|"
+    r"subscription\s+agreement|securities\s+purchase\s+agreement|\bPIPE\b|directed\s+share\s+program|"
+    r"\bin\s+(?:the\s+)?(?:[\w'-]+\s+){0,3}offering\b|\bpurchased\s+from\s+the\s+(?:issuer|company)\b", re.I)
+# Reporting owners that are funds / companies rather than people
+ENTITY_RE = re.compile(
+    r"\b(?:L\.?P\.?|LLC|L\.L\.C\.?|LLP|Ltd\.?|Limited|Inc\.?|Incorporated|Corp\.?|Corporation|Fund|Funds|"
+    r"Capital|Partners|Partnership|Holdings?|Management|Advisors|Advisers|Investments?|Ventures|Group|"
+    r"Company|Co\.|AG|GmbH|S\.A\.|N\.V\.|PLC|Foundation|Endowment|Bank|Trust\s+Company)(?=\W|$)", re.I)
+
+
+def is_entity(name: str) -> bool:
+    return bool(ENTITY_RE.search(name or ""))
+
+
 PLAN_RE = re.compile(r"10b5\s*-?\s*1", re.I)
 NOT_PLAN_RE = re.compile(r"\bnot\b[^.;]{0,80}10b5\s*-?\s*1|10b5\s*-?\s*1[^.;]{0,40}\b(?:terminated|cancell?ed)\b", re.I)
 
@@ -319,11 +340,15 @@ def parse_ownership_xml(xml_bytes: bytes, record: dict) -> dict:
     record["schema"] = _txt(root, "schemaVersion")
     # Form 4 checkbox (since 2023): "transaction made pursuant to a 10b5-1 plan"
     record["plan10b5"] = _flag(root, "aff10b5One")
-    plan_notes = []
+    plan_notes, offer_notes = [], []
     for fn in root.findall("footnotes/footnote"):
         text = " ".join("".join(fn.itertext()).split())
         if PLAN_RE.search(text) and not NOT_PLAN_RE.search(text):
             plan_notes.append(fn.get("id", ""))
+        if OFFERING_RE.search(text):
+            offer_notes.append(fn.get("id", ""))
+    remarks = " ".join(_txt(root, "remarks").split())
+    record["offering_doc"] = bool(OFFERING_RE.search(remarks))
     if not record.get("form"):
         record["form"] = _txt(root, "documentType")
     issuer = root.find("issuer")
@@ -361,6 +386,7 @@ def parse_ownership_xml(xml_bytes: bytes, record: dict) -> dict:
                 "own": _val(t, "ownershipNature/directOrIndirectOwnership").upper() or "D",
                 "nat": _val(t, "ownershipNature/natureOfOwnership"),
                 "plan": bool(set(_footnote_ids(t)) & set(plan_notes)),
+                "offer": bool(set(_footnote_ids(t)) & set(offer_notes)),
             })
     record["txns"] = txns
     return record
@@ -543,6 +569,319 @@ def classify_later_sales(trade_start: dt.date, records: list, held_after: float 
     return "none", "No", 0.0
 
 
+# ----------------------------------------------------------------------------
+# Company & price context
+# ----------------------------------------------------------------------------
+def latest_shares_outstanding(data: dict) -> float | None:
+    """Most recent shares-outstanding figure from an XBRL companyconcept response."""
+    facts = [f for f in ((data.get("units") or {}).get("shares") or []) if f.get("val")]
+    if not facts:
+        return None
+    latest_filed = max(f.get("filed", "") for f in facts)
+    same_filing = [f for f in facts if f.get("filed", "") == latest_filed]
+    latest_end = max(f.get("end", "") for f in same_filing)
+    vals = {float(f["val"]) for f in same_filing if f.get("end", "") == latest_end}
+    return sum(vals) if vals else None        # several distinct values = several share classes
+
+
+def yahoo_symbol(ticker: str) -> str | None:
+    sym = (ticker or "").strip().upper().replace(".", "-").replace("/", "-")
+    if not sym or sym in ("NONE", "N/A", "NA", "-") or not re.fullmatch(r"[A-Z0-9\-]{1,10}", sym):
+        return None
+    return sym
+
+
+def parse_yahoo_chart(raw: bytes) -> list | None:
+    """Yahoo v8 chart JSON -> [(iso date, close, adjusted close), ...] oldest first."""
+    try:
+        res = json.loads(raw)["chart"]["result"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not res:
+        return None
+    r = res[0]
+    ts = r.get("timestamp") or []
+    ind = r.get("indicators") or {}
+    closes = ((ind.get("quote") or [{}])[0].get("close")) or []
+    adj = ((ind.get("adjclose") or [{}])[0].get("adjclose")) or closes
+    offset = (r.get("meta") or {}).get("gmtoffset") or 0
+    bars = []
+    for t, c, a in zip(ts, closes, adj):
+        if c is None or t is None:
+            continue
+        d = dt.datetime.fromtimestamp(t + offset, dt.timezone.utc).date().isoformat()
+        bars.append((d, float(c), float(a if a is not None else c)))
+    return bars or None
+
+
+def price_metrics(bars: list, buy_date: dt.date, paid: float | None) -> dict:
+    """Split/dividend-safe price context around an insider purchase."""
+    if not bars or buy_date is None:
+        return {}
+    iso = buy_date.isoformat()
+    upto = [b for b in bars if b[0] <= iso]
+    last = bars[-1]
+    out = {"last_close": last[1], "last_date": last[0]}
+    if not upto:
+        return out
+    _, close_buy, adj_buy = upto[-1]
+    year_ago = (buy_date - dt.timedelta(days=365)).isoformat()
+    window = [b[2] for b in upto if b[0] >= year_ago]
+    if window:
+        out["off_high"] = (adj_buy / max(window) - 1.0) * 100.0
+    before = [b for b in upto if b[0] <= (buy_date - dt.timedelta(days=91)).isoformat()]
+    if before:
+        out["chg3m"] = (adj_buy / before[-1][2] - 1.0) * 100.0
+    ratio = last[2] / adj_buy if adj_buy else None
+    if ratio is not None:
+        basis = (close_buy / paid) if paid and paid > 0 else 1.0
+        out["since_buy"] = (ratio * basis - 1.0) * 100.0
+    return out
+
+
+def insider_net_flow(records: list, start: dt.date, end: dt.date) -> dict:
+    """Open-market buying vs selling by all insiders of a company between two dates."""
+    buy = sell = 0.0
+    buyers, sellers = set(), set()
+    for rec in records:
+        if rec.get("error") or not rec.get("owners"):
+            continue
+        who = owner_key(rec)
+        for t in rec.get("txns", []):
+            if t.get("t") != "N" or t.get("code") not in ("P", "S"):
+                continue
+            d = _to_date(t.get("date", ""))
+            if not d or d < start or d > end:
+                continue
+            v = (t.get("sh") or 0.0) * (t.get("px") or 0.0)
+            if t["code"] == "P":
+                buy += v
+                buyers.add(who)
+            else:
+                sell += v
+                sellers.add(who)
+    return {"buy": buy, "sell": sell, "buyers": len(buyers), "sellers": len(sellers)}
+
+
+def fmt_net90(flow: dict | None) -> str:
+    if not flow:
+        return ""
+    net = flow["buy"] - flow["sell"]
+    if not flow["buy"] and not flow["sell"]:
+        return "$0"
+    sign = "+" if net >= 0 else "-"
+    return f"{sign}{fmt_compact(abs(net))} ({flow['buyers']}B/{flow['sellers']}S)"
+
+
+def fmt_pct(v: float | None, plus: bool = True, digits: int = 1) -> str:
+    if v is None:
+        return ""
+    return f"{v:+.{digits}f}%" if plus else f"{v:.{digits}f}%"
+
+
+# ----------------------------------------------------------------------------
+# Signal Score
+# ----------------------------------------------------------------------------
+def signal_score(r: dict) -> tuple[int | None, list]:
+    """0-100 score for an open-market buy, with the reasons behind it.
+
+    Starts at 40 and adds/subtracts points for what research and practice associate with
+    informative insider buying. Missing data simply adds nothing.
+    """
+    if r.get("code") != "P":
+        return None, []
+    pts, why = 40, []
+
+    def add(n: int, text: str) -> None:
+        nonlocal pts
+        pts += n
+        why.append(f"{n:+d}  {text}")
+
+    n = int(r.get("cluster", 1) or 1)
+    if n >= 4:
+        add(22, f"{n} different insiders buying (cluster)")
+    elif n == 3:
+        add(18, "3 different insiders buying (cluster)")
+    elif n == 2:
+        add(12, "2 different insiders buying (cluster)")
+    roles = set(r.get("roles_all") or [])
+    if ROLE_CEO in roles or ROLE_CFO in roles:
+        add(8, "CEO or CFO is the buyer")
+    elif ROLE_DIR in roles and not r.get("entity"):
+        add(3, "director is the buyer")
+    v = r.get("value") or 0
+    if v >= 1_000_000:
+        add(6, "purchase of $1M or more")
+    elif v >= 250_000:
+        add(3, "purchase of $250k or more")
+    st = r.get("stake")
+    if st is not None:
+        if st == float("inf") or st >= 100:
+            add(12, "new position or more than doubled holding")
+        elif st >= 50:
+            add(9, f"holding up {st:.0f}%")
+        elif st >= 25:
+            add(6, f"holding up {st:.0f}%")
+        elif st >= 10:
+            add(3, f"holding up {st:.0f}%")
+    pk = r.get("pattern_kind")
+    if pk == "first":
+        add(10, "first open-market buy in 5+ years")
+    elif pk == "opp":
+        add(5, "opportunistic (no buying schedule)")
+    elif pk == "regular":
+        add(-12, "regular buyer (on a schedule)")
+    elif pk == "routine":
+        add(-20, "routine buyer (same time every year)")
+    if r.get("sold_kind") == "sold":
+        pct = r.get("sold_pct")
+        add(-25 if (pct is None or pct >= 25) else -10, "has sold shares since buying")
+    if r.get("plan"):
+        add(-15, "made under a 10b5-1 plan")
+    if r.get("offering"):
+        add(-25, "bought in a company offering / private placement")
+    if r.get("entity"):
+        add(-15, "buyer is a fund or company, not a person")
+    pc = r.get("cluster_pct_co")
+    if pc is not None:
+        if pc >= 1:
+            add(10, f"insiders bought {pc:.2f}% of the company")
+        elif pc >= 0.25:
+            add(7, f"insiders bought {pc:.2f}% of the company")
+        elif pc >= 0.05:
+            add(4, f"insiders bought {pc:.2f}% of the company")
+    mc = r.get("mcap")
+    if mc:
+        if mc < 300e6:
+            add(6, "micro/small cap (under $300M)")
+        elif mc < 2e9:
+            add(4, "small cap (under $2B)")
+        elif mc < 10e9:
+            add(1, "mid cap (under $10B)")
+        elif mc >= 200e9:
+            add(-3, "mega cap ($200B+)")
+    oh = r.get("off_high")
+    if oh is not None:
+        if oh <= -40:
+            add(7, f"bought {abs(oh):.0f}% below 52-week high")
+        elif oh <= -20:
+            add(4, f"bought {abs(oh):.0f}% below 52-week high")
+    c3 = r.get("chg3m")
+    if c3 is not None and c3 <= -20:
+        add(3, f"stock fell {abs(c3):.0f}% in the 3 months before")
+    sb = r.get("since")
+    if sb is not None and sb >= 30:
+        add(-6, f"already up {sb:.0f}% since the purchase")
+    f = r.get("net90")
+    if f:
+        if f["sell"] >= 250_000 and f["sell"] > 3 * max(f["buy"], 1.0):
+            add(-8, "insiders were heavy net sellers over 90 days")
+        elif f["buy"] > f["sell"]:
+            add(4, "insiders net buyers over 90 days")
+    if r.get("d13"):
+        add(5, "Schedule 13D (5%+ stake) filed in last 90 days")
+    # Disqualifiers cap the score however good everything else looks
+    caps = []
+    if r.get("offering"):
+        caps.append((30, "offering / placement purchase"))
+    if r.get("plan"):
+        caps.append((45, "10b5-1 plan purchase"))
+    if pk == "routine":
+        caps.append((45, "routine buyer"))
+    if r.get("sold_kind") == "sold" and (r.get("sold_pct") is None or r.get("sold_pct") >= 25):
+        caps.append((40, "sold 25%+ since"))
+    for cap, text in sorted(caps):
+        if pts > cap:
+            why.append(f"capped at {cap}: {text}")
+            pts = cap
+            break
+    return max(0, min(100, int(round(pts)))), why
+
+
+# ----------------------------------------------------------------------------
+# Track record of signals (kept even if the download cache is cleared)
+# ----------------------------------------------------------------------------
+class SignalLog:
+    def __init__(self, path: str | None = None):
+        self.conn = sqlite3.connect(path or cache_path(), timeout=30)
+        self.conn.execute("""CREATE TABLE IF NOT EXISTS signals (
+            acc TEXT PRIMARY KEY, ticker TEXT, company TEXT, insider TEXT, buy_date TEXT,
+            price REAL, value REAL, score INTEGER, first_seen TEXT, pattern TEXT, cluster INTEGER)""")
+        self.conn.commit()
+
+    def log(self, rows: list) -> int:
+        n = 0
+        today = dt.date.today().isoformat()
+        for r in rows:
+            if r.get("code") != "P" or r.get("score") is None or not r.get("ticker"):
+                continue
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO signals VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (r["acc"], r["ticker"], r.get("company", ""), r.get("insider", ""),
+                 r.get("trade_start") or r.get("filing_date"), r.get("price"), r.get("value"),
+                 r["score"], today, r.get("pattern", ""), r.get("cluster", 1)))
+            n += cur.rowcount
+        self.conn.commit()
+        return n
+
+    def all(self) -> list[dict]:
+        cur = self.conn.execute("SELECT * FROM signals ORDER BY buy_date DESC")
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def clear(self) -> None:
+        self.conn.execute("DELETE FROM signals")
+        self.conn.commit()
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+def score_band(score: int | None) -> str:
+    if score is None:
+        return "?"
+    return "70+" if score >= 70 else ("50-69" if score >= 50 else "under 50")
+
+
+def track_record_summary(items: list) -> dict:
+    """items: dicts with score, ret, excess -> per score band: count, avg return, avg vs SPY, % beating SPY."""
+    out = {}
+    for band in ("70+", "50-69", "under 50"):
+        sel = [x for x in items if score_band(x.get("score")) == band and x.get("ret") is not None]
+        if not sel:
+            out[band] = None
+            continue
+        ex = [x["excess"] for x in sel if x.get("excess") is not None]
+        out[band] = {"n": len(sel), "avg": sum(x["ret"] for x in sel) / len(sel),
+                     "avg_excess": (sum(ex) / len(ex)) if ex else None,
+                     "beat": (sum(1 for e in ex if e > 0) / len(ex) * 100) if ex else None}
+    return out
+
+
+class PriceClient(SecClient):
+    """Daily prices from Yahoo Finance's public chart endpoint (no key needed)."""
+
+    def __init__(self, cancel_event: threading.Event):
+        super().__init__(BROWSER_UA, cancel_event, rps=PRICE_RPS)
+
+    def bars(self, sym: str) -> list | None:
+        q = urllib.parse.quote(sym)
+        for host in ("query1", "query2"):
+            url = f"https://{host}.finance.yahoo.com/v8/finance/chart/{q}?range=2y&interval=1d&includeAdjustedClose=true"
+            try:
+                raw = self.get(url, retries=2)
+            except NotFound:
+                return None
+            except Cancelled:
+                raise
+            except Exception:
+                continue
+            b = parse_yahoo_chart(raw)
+            if b:
+                return b
+        return None
+
+
 def fmt_stake(pct: float | None) -> str:
     if pct is None:
         return ""
@@ -641,6 +980,7 @@ def evaluate_record(record: dict, cand: dict, params: ScanParams) -> list[dict]:
                 continue
             dates = sorted({x.get("date", "") for x in chunk if x.get("date")})
             plan = bool(record.get("plan10b5")) or any(x.get("plan") for x in chunk)
+            offering = bool(record.get("offering_doc")) or any(x.get("offer") for x in chunk)
             rows.append({
                 "filing_date": record.get("filing_date") or cand.get("date", ""),
                 "ticker": record.get("ticker") or cand.get("ticker", "") or "",
@@ -673,6 +1013,10 @@ def evaluate_record(record: dict, cand: dict, params: ScanParams) -> list[dict]:
                 "sold": "\u2026" if (code == "P" and params.check_history) else "",
                 "sold_kind": "pending" if (code == "P" and params.check_history) else "na",
                 "sold_pct": None,
+                "offering": offering,
+                "entity": is_entity(record["owners"][0].get("name", "")),
+                "roles_all": sorted(all_roles),
+                "deep": bool(code == "P" and params.check_history),
             })
     return rows
 
@@ -733,6 +1077,7 @@ class Scanner:
         self.clusters: dict[str, dict] = {}
         self._changed: set = set()
         self.buys: dict[str, dict] = {}       # accession -> purchase info for the history check
+        self._lists: dict[str, dict | None] = {}   # CIK -> {"f4": {...}, "d13": [...]}
 
     def post(self, kind: str, payload=None) -> None:
         self.q.put((self.scan_id, kind, payload))
@@ -864,25 +1209,32 @@ class Scanner:
                 continue
             b = self.buys.get(r["acc"])
             if b is None:
-                self.buys[r["acc"]] = {k: r[k] for k in ("owner_cik", "issuer_cik", "trade_start",
-                                                          "filing_date", "held_after", "value")}
+                self.buys[r["acc"]] = {k: r[k] for k in ("owner_cik", "issuer_cik", "trade_start", "ticker",
+                                                          "filing_date", "held_after", "value", "shares", "price")}
             else:
                 b["trade_start"] = min(b["trade_start"], r["trade_start"])
                 b["value"] += r["value"]
+                b["shares"] += r["shares"]
+                b["price"] = b["value"] / b["shares"] if b["shares"] else b["price"]
                 if r["held_after"] is not None:
                     b["held_after"] = max(b["held_after"] or 0.0, r["held_after"])
 
     # -- insider history: buying pattern + later sales -------------------------
     @staticmethod
     def _form4_list_task(client: SecClient, cik: int, since: str) -> dict:
-        """{accession: filing date} of every Form 4 listed under a CIK since a date."""
+        """{"f4": {accession: filing date}, "d13": [[date, form, accession]]} for a CIK since a date."""
         out: dict = {}
+        d13: list = []
 
         def add(block: dict) -> None:
             for acc, fdate, form in zip(block.get("accessionNumber", []), block.get("filingDate", []),
                                         block.get("form", [])):
-                if form == "4" and fdate >= since:
+                if fdate < since:
+                    continue
+                if form == "4":
                     out[acc] = fdate
+                elif re.match(r"(?:SC |SCHEDULE )13D", form or ""):
+                    d13.append([fdate, form, acc])
         data = json.loads(client.get(f"{SEC_DATA}/submissions/CIK{cik:010d}.json"))
         filings = data.get("filings", {})
         recent = filings.get("recent", {})
@@ -892,7 +1244,7 @@ class Scanner:
             for f in filings.get("files", []):
                 if f.get("filingTo", "") >= since:
                     add(json.loads(client.get(f"{SEC_DATA}/submissions/{f['name']}")))
-        return out
+        return {"f4": out, "d13": d13}
 
     @staticmethod
     def _unknown(reason: str = "Unavailable") -> dict:
@@ -937,40 +1289,14 @@ class Scanner:
             return
         self.post("phase", f"Checking buying history & later sales for {total:,} insiders...")
         self.post("history_progress", (0, total))
-        lists: dict[str, dict | None] = {}
+        lists = self._lists
         ex = ThreadPoolExecutor(max_workers=FETCH_WORKERS)
-
-        def collect(futures: dict, on_ok, on_fail) -> None:
-            for fut in as_completed(futures):
-                key = futures[fut]
-                try:
-                    on_ok(key, fut.result())
-                except Cancelled:
-                    raise
-                except SecAccessDenied as exc:
-                    if "User-Agent" in str(exc):
-                        raise
-                    on_fail(key)
-                except Exception:
-                    on_fail(key)
-            self.check_cancel()
-
+        collect = self._collector()
         try:
             for i in range(0, total, 20):
                 batch = order[i:i + 20]
                 # 1) Form 4 lists for each insider and company (cached for 6 hours)
-                futs = {}
-                for cik in {c for pair in batch for c in pair if c not in lists}:
-                    raw = cache.get_blob(f"f4list:{cik}", max_age=6 * 3600)
-                    if raw is not None:
-                        lists[cik] = json.loads(raw)
-                    else:
-                        futs[ex.submit(self._form4_list_task, client, int(cik), since)] = cik
-
-                def got_list(cik, data):
-                    lists[cik] = data
-                    cache.put_blob(f"f4list:{cik}", json.dumps(data).encode())
-                collect(futs, got_list, lambda cik: lists.__setitem__(cik, None))
+                self._load_lists(client, cache, ex, {c for pair in batch for c in pair}, since)
 
                 # 2) filings about this insider AND this company = intersection of the two lists
                 pair_accs: dict[tuple, set | None] = {}
@@ -980,11 +1306,12 @@ class Scanner:
                     if o_list is None or i_list is None:
                         pair_accs[pair] = None
                         continue
-                    accs = (set(o_list) & set(i_list)) | set(pairs[pair])
+                    o_f4, i_f4 = o_list["f4"], i_list["f4"]
+                    accs = (set(o_f4) & set(i_f4)) | set(pairs[pair])
                     pair_accs[pair] = accs
                     for a in accs:
                         if a not in todo and cache.get_filing(a) is None:
-                            todo[a] = {"acc": a, "date": o_list.get(a) or i_list.get(a) or "",
+                            todo[a] = {"acc": a, "date": o_f4.get(a) or i_f4.get(a) or "",
                                        "path": f"edgar/data/{pair[1]}/{a.replace('-', '')}/{a}.txt"}
                 futs = {ex.submit(self._fetch_one, client, c): a for a, c in todo.items()}
                 collect(futs, lambda a, rec: cache.put_filing(a, rec), lambda a: None)
@@ -1001,31 +1328,191 @@ class Scanner:
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
 
+    @staticmethod
+    def _shares_task(client: SecClient, cik: int) -> float | None:
+        for concept in ("dei/EntityCommonStockSharesOutstanding", "us-gaap/CommonStockSharesOutstanding"):
+            try:
+                data = json.loads(client.get(f"{SEC_DATA}/api/xbrl/companyconcept/CIK{cik:010d}/{concept}.json",
+                                             retries=2))
+            except NotFound:
+                continue
+            v = latest_shares_outstanding(data)
+            if v:
+                return v
+        return None
+
+    def context_phase(self, client: SecClient, cache: Cache) -> None:
+        """Company size, recent insider flow, 13D filings and price context for every buy row."""
+        issuers: dict[str, list] = {}
+        for acc, b in self.buys.items():
+            if b["issuer_cik"]:
+                issuers.setdefault(str(b["issuer_cik"]), []).append(acc)
+        if not issuers:
+            return
+        today = dt.date.today()
+        start90 = today - dt.timedelta(days=CONTEXT_DAYS)
+        since_hist = (_years_ago(today, HISTORY_YEARS) - dt.timedelta(days=120)).isoformat()
+        recent_since = (start90 - dt.timedelta(days=3)).isoformat()
+        order = sorted(issuers, key=lambda c: -max(self.buys[a]["value"] for a in issuers[c]))
+        total, done = len(order), 0
+        self.post("phase", f"Checking company size, recent insider activity & prices for {total:,} companies...")
+        self.post("context_progress", (0, total))
+        prices = PriceClient(self.cancel)
+        ex = ThreadPoolExecutor(max_workers=FETCH_WORKERS)
+        collect = self._collector()
+        try:
+            for i in range(0, total, 15):
+                batch = order[i:i + 15]
+                self._load_lists(client, cache, ex, set(batch), since_hist)
+                # 1) the company's Form 4s from the last 90 days (most are cached already)
+                todo: dict[str, dict] = {}
+                for cik in batch:
+                    lst = self._lists.get(cik)
+                    for a, fd in ((lst or {}).get("f4") or {}).items():
+                        if fd >= recent_since and a not in todo and cache.get_filing(a) is None:
+                            todo[a] = {"acc": a, "date": fd, "path": f"edgar/data/{cik}/{a.replace('-', '')}/{a}.txt"}
+                futs = {ex.submit(self._fetch_one, client, c): a for a, c in todo.items()}
+                collect(futs, lambda a, rec: cache.put_filing(a, rec), lambda a: None)
+                # 2) shares outstanding (cached a week)
+                shares: dict[str, float | None] = {}
+                futs = {}
+                for cik in batch:
+                    raw = cache.get_blob(f"shares:{cik}", max_age=7 * 86400)
+                    if raw is not None:
+                        shares[cik] = json.loads(raw)
+                    else:
+                        futs[ex.submit(self._shares_task, client, int(cik))] = cik
+
+                def ok_shares(cik, v):
+                    shares[cik] = v
+                    cache.put_blob(f"shares:{cik}", json.dumps(v).encode())
+                collect(futs, ok_shares, lambda cik: shares.__setitem__(cik, None))
+                # 3) daily prices (cached for the day)
+                bars: dict[str, list | None] = {}
+                futs = {}
+                for cik in batch:
+                    for acc in issuers[cik]:
+                        sym = yahoo_symbol(self.buys[acc]["ticker"])
+                        if not sym or sym in bars or sym in futs.values():
+                            continue
+                        raw = cache.get_blob(f"px:{sym}:{today}")
+                        if raw is not None:
+                            bars[sym] = json.loads(raw)
+                        else:
+                            futs[ex.submit(prices.bars, sym)] = sym
+
+                def ok_bars(sym, v):
+                    bars[sym] = v
+                    if v:
+                        cache.put_blob(f"px:{sym}:{today}", json.dumps(v).encode())
+                collect(futs, ok_bars, lambda sym: bars.__setitem__(sym, None))
+                # 4) combine
+                results = {}
+                for cik in batch:
+                    lst = self._lists.get(cik)
+                    recs = []
+                    if lst:
+                        for a, fd in lst["f4"].items():
+                            if fd >= recent_since:
+                                rec = cache.get_filing(a)
+                                if rec and not rec.get("error") and str(rec.get("issuer_cik")) == cik:
+                                    recs.append(rec)
+                    flow = insider_net_flow(recs, start90, today) if lst else None
+                    d13 = sorted((d for d in (lst or {}).get("d13", []) if d[0] >= start90.isoformat()), reverse=True)
+                    so = shares.get(cik)
+                    for acc in issuers[cik]:
+                        b = self.buys[acc]
+                        sym = yahoo_symbol(b["ticker"])
+                        pm = price_metrics(bars.get(sym) or [], _to_date(b["trade_start"]) or _to_date(b["filing_date"]),
+                                           b.get("price")) if sym else {}
+                        results[acc] = {
+                            "shares_out": so,
+                            "pct_co": (b["shares"] / so * 100.0) if so else None,
+                            "mcap": (so * pm["last_close"]) if (so and pm.get("last_close")) else None,
+                            "off_high": pm.get("off_high"), "chg3m": pm.get("chg3m"),
+                            "since": pm.get("since_buy"), "last_close": pm.get("last_close"),
+                            "net90": flow, "d13": len(d13), "d13_last": d13[0][0] if d13 else "",
+                            "prices_ok": bool(pm),
+                        }
+                    done += 1
+                cache.flush()
+                self.post("context", results)
+                self.post("context_progress", (done, total))
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+
+    def _collector(self):
+        def collect(futures: dict, on_ok, on_fail) -> None:
+            for fut in as_completed(futures):
+                key = futures[fut]
+                try:
+                    on_ok(key, fut.result())
+                except Cancelled:
+                    raise
+                except SecAccessDenied as exc:
+                    if "User-Agent" in str(exc):
+                        raise
+                    on_fail(key)
+                except Exception:
+                    on_fail(key)
+            self.check_cancel()
+        return collect
+
+    def _load_lists(self, client: SecClient, cache: Cache, ex: ThreadPoolExecutor, ciks: set, since: str) -> None:
+        """Fill self._lists for these CIKs (Form 4 + 13D lists; cached 6 hours)."""
+        futs = {}
+        for cik in ciks:
+            if cik in self._lists:
+                continue
+            raw = cache.get_blob(f"f4list2:{cik}", max_age=6 * 3600)
+            if raw is not None:
+                self._lists[cik] = json.loads(raw)
+            else:
+                futs[ex.submit(self._form4_list_task, client, int(cik), since)] = cik
+
+        def ok(cik, data):
+            self._lists[cik] = data
+            cache.put_blob(f"f4list2:{cik}", json.dumps(data).encode())
+        self._collector()(futs, ok, lambda cik: self._lists.__setitem__(cik, None))
+
     # -- clusters ------------------------------------------------------------
     def track(self, rec: dict, cand: dict) -> None:
         """Record which insiders traded each issuer, by code (any size / role)."""
         if rec.get("error") or not rec.get("owners") or not issuer_matches(rec, cand):
             return
         who = owner_key(rec)
-        by_code: dict[str, bool] = {}
+        by_code: dict[str, list] = {}       # code -> [discretionary?, shares all, $ all, shares disc, $ disc]
         for t in rec.get("txns", []):
             if t.get("t") == "N" and t.get("code") in TXN_CODES:
-                discretionary = not (rec.get("plan10b5") or t.get("plan"))
-                by_code[t["code"]] = by_code.get(t["code"], False) or discretionary
-        for code, disc in by_code.items():
+                disc = not (rec.get("plan10b5") or t.get("plan") or t.get("offer") or rec.get("offering_doc"))
+                sh, val = (t.get("sh") or 0.0), (t.get("sh") or 0.0) * (t.get("px") or 0.0)
+                agg = by_code.setdefault(t["code"], [False, 0.0, 0.0, 0.0, 0.0])
+                agg[0] = agg[0] or disc
+                agg[1] += sh
+                agg[2] += val
+                if disc:
+                    agg[3] += sh
+                    agg[4] += val
+        for code, (disc, sh_all, v_all, sh_disc, v_disc) in by_code.items():
             key = cluster_key(rec, code)
-            entry = self.clusters.setdefault(key, {"all": set(), "disc": set()})
-            n_all, n_disc = len(entry["all"]), len(entry["disc"])
+            entry = self.clusters.setdefault(key, {"all": set(), "disc": set(), "accs": {}})
+            if rec["acc"] in entry["accs"]:
+                continue
+            entry["accs"][rec["acc"]] = (sh_all, v_all, sh_disc, v_disc)
             entry["all"].add(who)
             if disc:
                 entry["disc"].add(who)
-            if (len(entry["all"]), len(entry["disc"])) != (n_all, n_disc):
-                self._changed.add(key)
+            self._changed.add(key)
 
     def flush_clusters(self, force: bool = False) -> None:  # noqa: ARG002
         if self._changed:
-            self.post("clusters", {k: (len(self.clusters[k]["all"]), len(self.clusters[k]["disc"]))
-                                   for k in self._changed})
+            out = {}
+            for k in self._changed:
+                e = self.clusters[k]
+                tot = [sum(v[i] for v in e["accs"].values()) for i in range(4)]
+                # (insiders, insiders excl. 10b5-1, shares, $, shares excl. 10b5-1, $ excl. 10b5-1)
+                out[k] = (len(e["all"]), len(e["disc"]), tot[0], tot[1], tot[2], tot[3])
+            self.post("clusters", out)
             self._changed = set()
 
     # -- main loop ---------------------------------------------------------
@@ -1109,6 +1596,7 @@ class Scanner:
             self.flush_clusters(force=True)
             if self.p.check_history and self.buys:
                 self.history_phase(client, cache)
+                self.context_phase(client, cache)
             stats["requests"] = client.request_count
             self.post("done", stats)
         except Cancelled:
@@ -1151,21 +1639,34 @@ def fmt_compact(v: float) -> str:
     return f"${v:,.0f}"
 
 
-CSV_HEADERS = ["Filing Date", "Ticker", "Company", "Insider Name", "Matched Role", "Exact Title",
+CSV_HEADERS = ["Filing Date", "Ticker", "Signal Score", "Company", "Insider Name", "Matched Role", "Exact Title",
                "Buy/Sell", "Transaction Code", "Shares", "Price", "Total Value ($)", "Stake Change %",
-               "Cluster (insiders)", "Cluster excl. 10b5-1", "10b5-1 Plan", "Pattern", "Sold Since",
-               "Sold % of Holding", "Trade Date(s)",
+               "Cluster (insiders)", "Cluster excl. 10b5-1", "Cluster % of Company", "% of Company (this buy)",
+               "Market Cap ($)", "% Off 52-Week High at Buy", "3-Month Change Before Buy %", "Change Since Buy %",
+               "Insider Net $ 90d", "Insider Buyers 90d", "Insider Sellers 90d", "13D Filings 90d",
+               "10b5-1 Plan", "Offering / Placement", "Fund / Company Buyer", "Pattern", "Sold Since",
+               "Sold % of Holding", "Score Reasons", "Trade Date(s)",
                "Lots", "Form", "Accession", "SEC Link", "Filing Index"]
 
 
 def row_to_csv(r: dict) -> list:
     stake = r.get("stake")
     stake_out = "" if stake is None else ("New position" if stake == float("inf") else round(stake, 2))
-    return [r["filing_date"], r["ticker"], r["company"], r["insider"], r["role"], r["title"],
+    def rnd(v, n=2):
+        return "" if v is None else round(v, n)
+    flow = r.get("net90") or {}
+    return [r["filing_date"], r["ticker"], "" if r.get("score") is None else r["score"],
+            r["company"], r["insider"], r["role"], r["title"],
             r["side"], r["code"], round(r["shares"], 4), round(r["price"], 4), round(r["value"], 2),
-            stake_out, r.get("cluster", 1), r.get("cluster_disc", 1), "Yes" if r.get("plan") else "No",
+            stake_out, r.get("cluster", 1), r.get("cluster_disc", 1), rnd(r.get("cluster_pct_co"), 4),
+            rnd(r.get("pct_co"), 4), rnd(r.get("mcap"), 0), rnd(r.get("off_high")), rnd(r.get("chg3m")),
+            rnd(r.get("since")), rnd((flow["buy"] - flow["sell"]) if flow else None, 0),
+            flow.get("buyers", ""), flow.get("sellers", ""), r.get("d13", ""),
+            "Yes" if r.get("plan") else "No", "Yes" if r.get("offering") else "No",
+            "Yes" if r.get("entity") else "No",
             r.get("pattern", ""), r.get("sold", ""),
             "" if r.get("sold_pct") is None else round(r["sold_pct"], 1),
+            "; ".join(x.strip() for x in r.get("score_why", [])),
             r["trade_dates"], r["lots"], r["form"], r["acc"], r["link"], r["index_link"]]
 
 
@@ -1195,6 +1696,7 @@ def run_gui() -> None:
         # key, heading, width, anchor, numeric
         ("filing_date", "Filing Date", 100, "w", False),
         ("ticker", "Ticker", 64, "w", False),
+        ("score", "Score", 58, "center", True),
         ("company", "Company", 150, "w", False),
         ("insider", "Insider Name", 150, "w", False),
         ("role", "Matched Role", 120, "w", False),
@@ -1205,7 +1707,13 @@ def run_gui() -> None:
         ("value", "Total Value ($)", 128, "e", True),
         ("stake", "Stake Δ %", 88, "e", True),
         ("cluster", "Cluster", 66, "center", True),
-        ("plan", "10b5-1", 62, "center", False),
+        ("pct_co", "% of Co.", 74, "e", True),
+        ("mcap", "Mkt Cap", 78, "e", True),
+        ("off_high", "Off 52w Hi", 92, "e", True),
+        ("chg3m", "3M Before", 80, "e", True),
+        ("since", "Since Buy", 86, "e", True),
+        ("net90", "Insiders 90d", 150, "w", True),
+        ("flags", "Flags", 110, "w", False),
         ("pattern", "Pattern", 215, "w", False),
         ("sold", "Sold Since", 145, "w", False),
         ("link", "SEC Link", 260, "w", False),
@@ -1213,8 +1721,22 @@ def run_gui() -> None:
     HEADINGS = {c[0]: c[1] for c in COLUMNS}
     TOOLTIPS = {
         "stake": "How much this trade grew (or shrank) the insider's holding. 'New' = first shares.",
-        "cluster": "Number of different insiders making the same kind of trade in this company during the scanned dates.",
-        "plan": "Yes = made under a pre-scheduled Rule 10b5-1 trading plan (less informative).",
+        "cluster": "Number of different insiders making the same kind of trade in this company during the scanned dates. "
+                   "With 'Exclude pre-planned 10b5-1 trades' on, plan and offering purchases don't count.",
+        "flags": "10b5-1 = pre-scheduled trading plan  •  Offering = bought in a company offering / private "
+                 "placement  •  Fund = buyer is a fund or company  •  13D = a 5%+ holder filed Schedule 13D in "
+                 "the last 90 days.",
+        "score": "Signal Score 0-100: starts at 40 and adds or subtracts points for cluster size, CEO/CFO, "
+                 "stake increase, first buy vs routine, later sales, 10b5-1/offering/fund flags, % of company, "
+                 "company size, price drop before the buy, rise since, insider net flow and 13D filings. "
+                 "Right-click a row > 'Why this score?' for the breakdown.",
+        "pct_co": "Shares the whole cluster of insiders bought, as a % of shares outstanding (SEC XBRL data).",
+        "mcap": "Market value: latest shares outstanding (SEC) x latest close (Yahoo Finance).",
+        "off_high": "How far below its 52-week high the stock was on the purchase date.",
+        "chg3m": "Stock price change over the 3 months before the purchase.",
+        "since": "Price change from what the insider paid to the latest close (split/dividend adjusted).",
+        "net90": "Open-market buying minus selling by ALL insiders of the company over the last 90 days "
+                 "(B = buyers, S = sellers).",
         "pattern": "The insider's earlier open-market buys in this company (last 5 years): First buy, "
                    "Opportunistic (no schedule), Regular (most recent quarters / 2 of 3 years) or "
                    "Routine (same time every year for 3 years).",
@@ -1302,6 +1824,8 @@ def run_gui() -> None:
             fm = tk.Menu(m, tearoff=0)
             fm.add_command(label="Export Results to CSV...", command=self.export_csv, accelerator="Ctrl+E")
             fm.add_separator()
+            fm.add_command(label="Signal Track Record...", command=self.show_track_record, accelerator="Ctrl+T")
+            fm.add_separator()
             fm.add_command(label="Open Data Folder", command=self.open_data_folder)
             fm.add_command(label="Clear Download Cache", command=self.clear_cache)
             fm.add_separator()
@@ -1315,6 +1839,7 @@ def run_gui() -> None:
             m.add_cascade(label="Help", menu=hm)
             self.root.config(menu=m)
             self.root.bind_all("<Control-e>", lambda e: self.export_csv())
+            self.root.bind_all("<Control-t>", lambda e: self.show_track_record())
 
         # ---- settings panel --------------------------------------------
         def _controls(self):
@@ -1417,7 +1942,7 @@ def run_gui() -> None:
             f2 = ttk.Frame(box)
             f2.pack(fill="x", pady=(4, 0))
             self.history_var = tk.BooleanVar(value=st.get("check_history", True))
-            ttk.Checkbutton(f2, text="Check buyers' history during scan (Pattern + Sold Since)",
+            ttk.Checkbutton(f2, text="Deep check buyers (history, later sales, company size, prices)",
                             variable=self.history_var).pack(side="left", padx=(0, 22))
             self.hide_routine_var = tk.BooleanVar(value=st.get("hide_routine", False))
             ttk.Checkbutton(f2, text="Hide routine / regular buyers", variable=self.hide_routine_var,
@@ -1425,8 +1950,29 @@ def run_gui() -> None:
             self.hide_sold_var = tk.BooleanVar(value=st.get("hide_sold", False))
             ttk.Checkbutton(f2, text="Hide buyers who have sold since", variable=self.hide_sold_var,
                             command=self._view_changed).pack(side="left", padx=(0, 22))
-            ttk.Label(f2, text="History check adds ~1 request per filing it needs; results are cached.",
+            ttk.Label(f2, text="Deep check adds a few minutes the first time; results are cached.",
                       style="Hint.TLabel").pack(side="left")
+
+            f3 = ttk.Frame(box)
+            f3.pack(fill="x", pady=(4, 0))
+            self.excl_offer_var = tk.BooleanVar(value=st.get("exclude_offering", True))
+            ttk.Checkbutton(f3, text="Exclude offering / private-placement buys", variable=self.excl_offer_var,
+                            command=self._view_changed).pack(side="left", padx=(0, 22))
+            self.excl_entity_var = tk.BooleanVar(value=st.get("exclude_entity", False))
+            ttk.Checkbutton(f3, text="Exclude funds / companies as buyers", variable=self.excl_entity_var,
+                            command=self._view_changed).pack(side="left", padx=(0, 22))
+            vnum = (self.root.register(lambda s: re.fullmatch(r"\d{0,7}", s) is not None), "%P")
+            ttk.Label(f3, text="Min score").pack(side="left")
+            self.min_score_var = tk.StringVar(value=str(st.get("min_score", "0")))
+            e3 = ttk.Entry(f3, textvariable=self.min_score_var, width=5, validate="key", validatecommand=vnum)
+            e3.pack(side="left", padx=(4, 22))
+            e3.bind("<KeyRelease>", lambda ev: self._view_changed())
+            ttk.Label(f3, text="Max market cap $M").pack(side="left")
+            self.max_mcap_var = tk.StringVar(value=str(st.get("max_mcap", "")))
+            e4 = ttk.Entry(f3, textvariable=self.max_mcap_var, width=8, validate="key", validatecommand=vnum)
+            e4.pack(side="left", padx=4)
+            e4.bind("<KeyRelease>", lambda ev: self._view_changed())
+            ttk.Label(f3, text="(blank = any)", style="Hint.TLabel").pack(side="left")
 
             # SEC contact ---------------------------------------------------
             f = ttk.Frame(outer)
@@ -1485,6 +2031,9 @@ def run_gui() -> None:
             self.history_var.set(True)
             self.hide_routine_var.set(True)
             self.hide_sold_var.set(True)
+            self.excl_offer_var.set(True)
+            self.excl_entity_var.set(True)
+            self.min_score_var.set("0")
             self._view_changed()
             self.status_var.set("Preset applied: open-market buys ≥ $100k, 30 days, ≥ 2 insiders, no 10b5-1 "
                                 "plans, stake +10%, no routine buyers, no later sellers. Click Start Scan.")
@@ -1517,12 +2066,17 @@ def run_gui() -> None:
             self.tree.bind("<Double-1>", self._on_double)
             self.tree.bind("<Return>", lambda e: self.open_selected())
             self.tree.bind("<Button-3>", self._on_right_click)
+            self.hidden_cols = set(self.settings.get("hidden_cols", ["chg3m"])) & {c[0] for c in COLUMNS}
+            self._apply_columns()
             self.tree.bind("<Control-c>", lambda e: self.copy_selected())
             self.tree.bind("<Motion>", self._on_motion)
             self.tree.bind("<Leave>", lambda e: self._hide_tip())
             self._tip = None
 
             self.ctx = tk.Menu(self.root, tearoff=0)
+            self.ctx.add_command(label="Why this score?", command=self.explain_score)
+            self.ctx.add_command(label="Open price chart (Yahoo Finance)", command=self.open_chart)
+            self.ctx.add_separator()
             self.ctx.add_command(label="Open Form 4 on SEC.gov", command=self.open_selected)
             self.ctx.add_command(label="Open filing index page", command=lambda: self.open_selected(index=True))
             self.ctx.add_separator()
@@ -1618,6 +2172,9 @@ def run_gui() -> None:
                 "cluster_min": self._cluster_min(), "min_stake": self.min_stake_var.get(),
                 "check_history": self.history_var.get(), "hide_routine": self.hide_routine_var.get(),
                 "hide_sold": self.hide_sold_var.get(),
+                "exclude_offering": self.excl_offer_var.get(), "exclude_entity": self.excl_entity_var.get(),
+                "min_score": self.min_score_var.get(), "max_mcap": self.max_mcap_var.get(),
+                "hidden_cols": sorted(self.hidden_cols),
             })
 
         # ---- scan control -------------------------------------------------
@@ -1664,8 +2221,11 @@ def run_gui() -> None:
             self.start_btn.config(state="normal")
             self.cancel_btn.config(state="disabled")
             if self.rows and self.sort_key is None:
-                self.sort_key, self.sort_desc = "filing_date", False
-                self.sort_by("filing_date")      # toggles to descending
+                if any(r.get("score") is not None for r in self.rows.values()):
+                    self.sort_by("score")            # best signals first
+                else:
+                    self.sort_key, self.sort_desc = "filing_date", False
+                    self.sort_by("filing_date")      # toggles to descending
             else:
                 self._apply_view()
 
@@ -1709,6 +2269,16 @@ def run_gui() -> None:
                 done, total = payload
                 self.progress.config(mode="determinate", maximum=max(1, total), value=done)
                 self.status_var.set(f"Checking buyers' history & later sales: {done:,} of {total:,} insiders...")
+            elif kind == "context":
+                for acc, info in payload.items():
+                    for iid in self.by_acc.get(acc, []):
+                        self.rows[iid].update(info)
+                        self._refresh_row(iid)
+                self._schedule_view()
+            elif kind == "context_progress":
+                done, total = payload
+                self.progress.config(mode="determinate", maximum=max(1, total), value=done)
+                self.status_var.set(f"Checking company size, insider activity & prices: {done:,} of {total:,} companies...")
             elif kind == "clusters":
                 self.clusters.update(payload)
                 for key in payload:
@@ -1733,6 +2303,13 @@ def run_gui() -> None:
                                         f"{payload['matched']:,} matches in {secs:,.0f}s{extra}")
                 self._finish(int(float(self.progress.cget("maximum"))))
                 self._update_summary()
+                if kind == "done":
+                    try:
+                        log = SignalLog()
+                        log.log(list(self.rows.values()))
+                        log.close()
+                    except Exception:
+                        pass
             elif kind == "error":
                 self.status_var.set("Scan stopped with an error.")
                 self._finish()
@@ -1740,9 +2317,15 @@ def run_gui() -> None:
 
         # ---- rows / view ----------------------------------------------------
         def _cluster_count(self, r: dict) -> int:
-            all_n, disc_n = self.clusters.get(r["cluster_key"], (1, 0 if r.get("plan") else 1))
+            all_n, disc_n = self.clusters.get(r["cluster_key"], (1, 0 if r.get("plan") else 1))[:2]
             n = disc_n if self.excl_plan_var.get() else all_n
             return max(n, 0 if (self.excl_plan_var.get() and r.get("plan")) else 1)
+
+        def _cluster_shares(self, r: dict) -> float:
+            c = self.clusters.get(r["cluster_key"])
+            if not c or len(c) < 6:
+                return r["shares"]
+            return c[4] if self.excl_plan_var.get() else c[2]
 
         def _cluster_min(self) -> int:
             try:
@@ -1751,13 +2334,32 @@ def run_gui() -> None:
                 return 2
 
         def _values(self, r: dict) -> tuple:
-            return (r["filing_date"], r["ticker"], r["company"], r["insider"], r["role"], r["title"],
+            score = r.get("score")
+            return (r["filing_date"], r["ticker"], "" if score is None else score,
+                    r["company"], r["insider"], r["role"], r["title"],
                     r["side"], f"{r['shares']:,.0f}", fmt_money(r["price"], 2), fmt_money(r["value"]),
-                    fmt_stake(r.get("stake")), r["cluster"], "Yes" if r.get("plan") else "",
+                    fmt_stake(r.get("stake")), r["cluster"],
+                    fmt_pct(r.get("cluster_pct_co"), plus=False, digits=2),
+                    fmt_compact(r["mcap"]) if r.get("mcap") else "",
+                    fmt_pct(r.get("off_high"), plus=False, digits=0), fmt_pct(r.get("chg3m"), digits=0),
+                    fmt_pct(r.get("since"), digits=0), fmt_net90(r.get("net90")), self._flags(r),
                     r.get("pattern", ""), r.get("sold", ""), r["link"])
 
+        @staticmethod
+        def _flags(r: dict) -> str:
+            f = []
+            if r.get("plan"):
+                f.append("10b5-1")
+            if r.get("offering"):
+                f.append("Offering")
+            if r.get("entity"):
+                f.append("Fund")
+            if r.get("d13"):
+                f.append("13D")
+            return ", ".join(f)
+
         def _tags(self, r: dict) -> tuple:
-            if r["code"] == "P" and r.get("sold_kind") == "sold":
+            if r["code"] == "P" and (r.get("sold_kind") == "sold" or r.get("offering")):
                 return ("flip",)
             if r["code"] == "P" and r.get("pattern_kind") in ("routine", "regular"):
                 return ("routine",)
@@ -1766,7 +2368,7 @@ def run_gui() -> None:
             return (r["side"],)
 
         def _insert(self, r: dict):
-            r["cluster"] = self._cluster_count(r)
+            self._compute(r)
             iid = self.tree.insert("", "end", values=self._values(r), tags=self._tags(r))
             self.rows[iid] = r
             self.order.append(iid)
@@ -1778,9 +2380,16 @@ def run_gui() -> None:
 
         def _refresh_row(self, iid: str):
             r = self.rows[iid]
+            self._compute(r)
+            self.tree.item(iid, values=self._values(r), tags=self._tags(r))
+
+        def _compute(self, r: dict) -> None:
             r["cluster"] = self._cluster_count(r)
             r["cluster_disc"] = self.clusters.get(r["cluster_key"], (1, 1))[1]
-            self.tree.item(iid, values=self._values(r), tags=self._tags(r))
+            so = r.get("shares_out")
+            r["cluster_pct_co"] = (self._cluster_shares(r) / so * 100.0) if so else None
+            if r["code"] == "P":
+                r["score"], r["score_why"] = signal_score(r)
 
         def _visible(self, r: dict) -> bool:
             if self.only_ticker and r["ticker"] != self.only_ticker:
@@ -1792,6 +2401,15 @@ def run_gui() -> None:
             if self.hide_routine_var.get() and r.get("pattern_kind") in ("routine", "regular"):
                 return False
             if self.hide_sold_var.get() and r.get("sold_kind") == "sold":
+                return False
+            if self.excl_offer_var.get() and r.get("offering"):
+                return False
+            if self.excl_entity_var.get() and r.get("entity") and r["code"] == "P":
+                return False
+            min_score = int(self.min_score_var.get() or 0) if self.min_score_var.get().isdigit() else 0
+            if min_score and r["code"] == "P" and (r.get("score") or 0) < min_score:
+                return False
+            if self.max_mcap_var.get().isdigit() and r.get("mcap") and r["mcap"] > int(self.max_mcap_var.get()) * 1e6:
                 return False
             try:
                 min_stake = float(self.min_stake_var.get() or 0)
@@ -1837,6 +2455,9 @@ def run_gui() -> None:
             sells = [r for r in vis if r["code"] == "S"]
             clusters = {r["ticker"] for r in buys if r["cluster"] >= 2}
             txt = f"Showing {len(vis):,} of {total:,} trades"
+            strong = sum(1 for r in buys if (r.get("score") or 0) >= 70)
+            if strong:
+                txt += f"   •   Score 70+: {strong:,}"
             txt += (f"   •   Buys: {len(buys):,} ({fmt_compact(sum(r['value'] for r in buys))})"
                     f"   •   Sells: {len(sells):,} ({fmt_compact(sum(r['value'] for r in sells))})"
                     f"   •   Cluster-buy tickers: {len(clusters):,}")
@@ -1867,12 +2488,20 @@ def run_gui() -> None:
                 self.sort_desc = not self.sort_desc
             else:
                 self.sort_key, self.sort_desc = key, numeric   # numbers default high-to-low
-            if numeric:
+            if key == "net90":
+                def kf(iid):
+                    f = self.rows[iid].get("net90")
+                    return ((f["buy"] - f["sell"]) if f else -INF, self.rows[iid]["value"])
+            elif key == "pct_co":
+                def kf(iid):
+                    v = self.rows[iid].get("cluster_pct_co")
+                    return (-INF if v is None else v, self.rows[iid]["value"])
+            elif numeric:
                 def kf(iid):
                     v = self.rows[iid].get(key)
                     return (-INF if v is None else v, self.rows[iid]["value"])
-            elif key == "plan":
-                kf = lambda iid: (bool(self.rows[iid].get("plan")), self.rows[iid]["value"])
+            elif key == "flags":
+                kf = lambda iid: (self._flags(self.rows[iid]), self.rows[iid]["value"])
             elif key == "pattern":
                 kf = lambda iid: (-PATTERN_ORDER.get(self.rows[iid].get("pattern_kind", "na"), 9), self.rows[iid]["value"])
             elif key == "sold":
@@ -1897,12 +2526,67 @@ def run_gui() -> None:
             if iid:
                 webbrowser.open(self.rows[iid]["link"])
 
+        def _apply_columns(self):
+            self.tree["displaycolumns"] = [c[0] for c in COLUMNS if c[0] not in self.hidden_cols]
+
+        def _column_menu(self, event):
+            menu = tk.Menu(self.root, tearoff=0)
+            for key, head, *_ in COLUMNS:
+                if key in ("filing_date", "ticker"):
+                    continue
+                var = tk.BooleanVar(value=key not in self.hidden_cols)
+                menu.add_checkbutton(label=head, variable=var,
+                                     command=lambda k=key, v=var: self._toggle_column(k, v.get()))
+                menu._vars = getattr(menu, "_vars", []) + [var]   # keep references alive
+            menu.add_separator()
+            menu.add_command(label="Show all columns", command=lambda: self._toggle_column(None, True))
+            menu.tk_popup(event.x_root, event.y_root)
+
+        def _toggle_column(self, key, show):
+            if key is None:
+                self.hidden_cols.clear()
+            elif show:
+                self.hidden_cols.discard(key)
+            else:
+                self.hidden_cols.add(key)
+            self._apply_columns()
+
         def _on_right_click(self, event):
+            if self.tree.identify_region(event.x, event.y) == "heading":
+                self._column_menu(event)
+                return
             iid = self.tree.identify_row(event.y)
             if iid:
                 if iid not in self.tree.selection():
                     self.tree.selection_set(iid)
                 self.ctx.tk_popup(event.x_root, event.y_root)
+
+        def explain_score(self):
+            sel = self.tree.selection()
+            if not sel:
+                return
+            r = self.rows[sel[0]]
+            if r.get("score") is None:
+                messagebox.showinfo(APP_NAME, "Scores are calculated for open-market purchases (Code P) only.")
+                return
+            lines = [f"{r['ticker']} - {r['insider']} - {fmt_money(r['value'])}", "",
+                     f"Signal Score: {r['score']} / 100", "", "+40  starting point"]
+            lines += r.get("score_why") or []
+            if not r.get("prices_ok") and r.get("deep"):
+                lines += ["", "(No price data - price-based points not included.)"]
+            if not r.get("deep"):
+                lines += ["", "(Deep check was off - history, company and price points not included.)"]
+            messagebox.showinfo(APP_NAME, "\n".join(lines))
+
+        def open_chart(self):
+            sel = self.tree.selection()
+            if sel:
+                sym = yahoo_symbol(self.rows[sel[0]]["ticker"])
+                if sym:
+                    webbrowser.open(f"https://finance.yahoo.com/quote/{sym}/chart")
+
+        def show_track_record(self):
+            TrackRecordWindow(self)
 
         def filter_to_ticker(self):
             sel = self.tree.selection()
@@ -2007,6 +2691,10 @@ def run_gui() -> None:
                 "• Sold Since = open-market sales (Code S) in the same company on or after the purchase date, as "
                 "a % of the shares held right after buying. Shares withheld for taxes on vesting (Code F) are "
                 "not counted. Re-scan later to refresh.\n\n"
+                "• Signal Score (0-100) adds up all of the above plus company size, % of the company bought, "
+                "price drop before the buy, any rise since, net insider buying/selling over 90 days and "
+                "recent 13D filings. Right-click a row > 'Why this score?' to see every point.\n\n"
+                "• File > Signal Track Record shows how logged signals have done since, versus SPY.\n\n"
                 "The ★ preset sets: open-market buys only, ≥ $100k, last 30 days, all roles, "
                 "≥ 2 insiders, no 10b5-1 plans, stake +10% or more, and hides routine/regular buyers and "
                 "buyers who have sold since.\n\n"
@@ -2021,6 +2709,182 @@ def run_gui() -> None:
                 self.cancel_event.set()
             self.root.destroy()
 
+    class TrackRecordWindow:
+        """How past signals have done since the insider bought, vs SPY, grouped by score band."""
+        COLS = [("first_seen", "Logged", 90, "w"), ("ticker", "Ticker", 64, "w"), ("insider", "Insider", 170, "w"),
+                ("buy_date", "Buy Date", 90, "w"), ("price", "Paid", 76, "e"), ("score", "Score", 56, "center"),
+                ("pattern", "Pattern", 200, "w"), ("now", "Last", 76, "e"), ("ret", "Return", 76, "e"),
+                ("spy", "SPY", 70, "e"), ("excess", "vs SPY", 76, "e"), ("days", "Days", 54, "e")]
+
+        def __init__(self, app):
+            self.app = app
+            self.q: queue.Queue = queue.Queue()
+            self.win = tk.Toplevel(app.root)
+            self.win.title(f"{APP_NAME} - Signal Track Record")
+            self.win.geometry("1180x660")
+            top = ttk.Frame(self.win, padding=(12, 10, 12, 4))
+            top.pack(fill="x")
+            ttk.Label(top, text="Signal Track Record", style="Title.TLabel").pack(side="left")
+            ttk.Button(top, text="Clear history", command=self.clear).pack(side="right")
+            ttk.Button(top, text="Export CSV...", command=self.export).pack(side="right", padx=6)
+            self.refresh_btn = ttk.Button(top, text="Refresh prices", command=self.refresh)
+            self.refresh_btn.pack(side="right")
+            self.summary = tk.StringVar(value="Loading...")
+            ttk.Label(self.win, textvariable=self.summary, padding=(12, 2), justify="left",
+                      font=(app.base_font[0], app.base_font[1])).pack(fill="x")
+            ttk.Label(self.win, padding=(12, 0, 12, 6), style="Hint.TLabel", wraplength=1120, justify="left",
+                      text="Every open-market buy that received a score in a completed scan is logged once, with its "
+                           "score at the time. Return = from the insider's purchase price to the latest close "
+                           "(split/dividend adjusted). SPY = the S&P 500 ETF over the same dates. Double-click a row "
+                           "for its price chart.").pack(fill="x")
+            wrap = ttk.Frame(self.win, padding=(12, 0, 12, 10))
+            wrap.pack(fill="both", expand=True)
+            self.tree = ttk.Treeview(wrap, columns=[c[0] for c in self.COLS], show="headings")
+            for key, head, w, anchor in self.COLS:
+                self.tree.heading(key, text=head, command=lambda k=key: self.sort(k))
+                self.tree.column(key, width=w, anchor=anchor, stretch=key in ("insider", "pattern"))
+            vs = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
+            self.tree.configure(yscrollcommand=vs.set)
+            self.tree.pack(side="left", fill="both", expand=True)
+            vs.pack(side="right", fill="y")
+            self.tree.tag_configure("up", foreground="#14532d")
+            self.tree.tag_configure("down", foreground="#7f1d1d")
+            self.tree.bind("<Double-1>", self._open)
+            self.sort_key, self.sort_desc = "buy_date", True
+            log = SignalLog()
+            self.items = log.all()
+            log.close()
+            self.render()
+            if self.items:
+                self.refresh()
+            else:
+                self.summary.set("No signals logged yet - run a scan with 'Deep check buyers' on.")
+
+        def render(self):
+            self.tree.delete(*self.tree.get_children())
+
+            def key(x):
+                v = x.get(self.sort_key)
+                return (v is None, v if v is not None else 0)
+            for x in sorted(self.items, key=key, reverse=self.sort_desc):
+                ret = x.get("ret")
+                tag = ("up",) if (ret or 0) > 0 else (("down",) if ret is not None else ())
+                self.tree.insert("", "end", iid=x["acc"], tags=tag, values=(
+                    x["first_seen"], x["ticker"], x["insider"], x["buy_date"],
+                    fmt_money(x["price"] or 0, 2), x["score"], x.get("pattern", ""),
+                    fmt_money(x["now"], 2) if x.get("now") else "", fmt_pct(ret, digits=1),
+                    fmt_pct(x.get("spy"), digits=1), fmt_pct(x.get("excess"), digits=1),
+                    x.get("days", "")))
+            self._summarise()
+
+        def _summarise(self):
+            if not self.items:
+                return
+            summ = track_record_summary(self.items)
+            lines = []
+            for band in ("70+", "50-69", "under 50"):
+                b = summ.get(band)
+                if not b:
+                    lines.append(f"Score {band}:  no priced signals yet")
+                    continue
+                vs = "" if b["avg_excess"] is None else f",  vs SPY {b['avg_excess']:+.1f}%,  beat SPY {b['beat']:.0f}% of the time"
+                lines.append(f"Score {band}:  {b['n']} signals,  average return {b['avg']:+.1f}%{vs}")
+            self.summary.set("\n".join(lines))
+
+        def sort(self, key):
+            self.sort_desc = (not self.sort_desc) if self.sort_key == key else True
+            self.sort_key = key
+            self.render()
+
+        def refresh(self):
+            self.refresh_btn.config(state="disabled")
+            self.summary.set("Fetching prices from Yahoo Finance...")
+            items = [dict(x) for x in self.items]
+            threading.Thread(target=self._fetch, args=(items,), daemon=True).start()
+            self.win.after(200, self._poll)
+
+        def _fetch(self, items):
+            try:
+                cache = Cache(cache_path())
+                client = PriceClient(threading.Event())
+                today = dt.date.today()
+
+                def bars_for(sym):
+                    raw = cache.get_blob(f"px:{sym}:{today}")
+                    if raw is not None:
+                        return json.loads(raw)
+                    b = client.bars(sym)
+                    if b:
+                        cache.put_blob(f"px:{sym}:{today}", json.dumps(b).encode())
+                    return b
+                spy = bars_for("SPY") or []
+                done = {}
+                for x in items:
+                    sym = yahoo_symbol(x["ticker"])
+                    if sym and sym not in done:
+                        done[sym] = bars_for(sym) or []
+                    d = _to_date(x["buy_date"] or "")
+                    pm = price_metrics(done.get(sym) or [], d, x["price"]) if (sym and d) else {}
+                    sp = price_metrics(spy, d, None) if (spy and d) else {}
+                    x["ret"] = pm.get("since_buy")
+                    x["now"] = pm.get("last_close")
+                    x["spy"] = sp.get("since_buy")
+                    x["excess"] = (x["ret"] - x["spy"]) if (x["ret"] is not None and x["spy"] is not None) else None
+                    x["days"] = (today - d).days if d else ""
+                cache.close()
+                self.q.put(items)
+            except Exception as exc:
+                self.q.put(exc)
+
+        def _poll(self):
+            try:
+                res = self.q.get_nowait()
+            except queue.Empty:
+                if self.win.winfo_exists():
+                    self.win.after(200, self._poll)
+                return
+            if not self.win.winfo_exists():
+                return
+            self.refresh_btn.config(state="normal")
+            if isinstance(res, Exception):
+                self.summary.set(f"Could not fetch prices: {res}")
+                return
+            self.items = res
+            self.render()
+
+        def _open(self, event):
+            iid = self.tree.identify_row(event.y)
+            x = next((i for i in self.items if i["acc"] == iid), None)
+            sym = yahoo_symbol(x["ticker"]) if x else None
+            if sym:
+                webbrowser.open(f"https://finance.yahoo.com/quote/{sym}/chart")
+
+        def export(self):
+            path = filedialog.asksaveasfilename(parent=self.win, defaultextension=".csv",
+                                                initialfile=f"signal_track_record_{dt.date.today():%Y%m%d}.csv",
+                                                filetypes=[("CSV (Excel)", "*.csv")])
+            if not path:
+                return
+            with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+                w = csv.writer(fh)
+                w.writerow(["Logged", "Ticker", "Company", "Insider", "Buy Date", "Paid", "Value", "Score",
+                            "Pattern", "Cluster", "Last", "Return %", "SPY %", "vs SPY %", "Days", "Accession"])
+                for x in self.items:
+                    w.writerow([x["first_seen"], x["ticker"], x["company"], x["insider"], x["buy_date"], x["price"],
+                                x["value"], x["score"], x.get("pattern", ""), x.get("cluster", ""), x.get("now", ""),
+                                "" if x.get("ret") is None else round(x["ret"], 2),
+                                "" if x.get("spy") is None else round(x["spy"], 2),
+                                "" if x.get("excess") is None else round(x["excess"], 2), x.get("days", ""), x["acc"]])
+
+        def clear(self):
+            if messagebox.askyesno(APP_NAME, "Delete the whole signal history? This cannot be undone.", parent=self.win):
+                log = SignalLog()
+                log.clear()
+                log.close()
+                self.items = []
+                self.render()
+                self.summary.set("History cleared.")
+
     root = tk.Tk()
     App(root)
     root.mainloop()
@@ -2030,12 +2894,30 @@ def run_gui() -> None:
 # CLI (handy for scripting / troubleshooting)
 # ============================================================================
 def apply_signal_filters(rows: list, clusters: dict, exclude_plan: bool, min_cluster: int,
-                         min_stake: float, hide_routine: bool = False, hide_sold: bool = False) -> list:
-    """Same logic as the GUI's instant filters (used by the CLI and tests)."""
+                         min_stake: float, hide_routine: bool = False, hide_sold: bool = False,
+                         exclude_offering: bool = False, exclude_entity: bool = False,
+                         min_score: int = 0) -> list:
+    """Same logic as the GUI's instant filters (used by the CLI and tests). Also computes scores."""
     out = []
     for r in rows:
-        all_n, disc_n = clusters.get(r["cluster_key"], (1, 0 if r.get("plan") else 1))
+        c = clusters.get(r["cluster_key"], (1, 0 if r.get("plan") else 1))
+        all_n, disc_n = c[:2]
         r["cluster"], r["cluster_disc"] = (disc_n if exclude_plan else all_n), disc_n
+        if exclude_plan and r.get("plan"):
+            r["cluster"] = disc_n
+        elif r["cluster"] < 1:
+            r["cluster"] = 1
+        so = r.get("shares_out")
+        csh = (c[4] if exclude_plan else c[2]) if len(c) >= 6 else r["shares"]
+        r["cluster_pct_co"] = (csh / so * 100.0) if so else None
+        if r["code"] == "P":
+            r["score"], r["score_why"] = signal_score(r)
+        if exclude_offering and r.get("offering"):
+            continue
+        if exclude_entity and r.get("entity") and r["code"] == "P":
+            continue
+        if min_score and r["code"] == "P" and (r.get("score") or 0) < min_score:
+            continue
         if exclude_plan and r.get("plan"):
             continue
         if min_cluster and r["cluster"] < min_cluster:
@@ -2069,6 +2951,9 @@ def run_cli(argv: list[str]) -> int:
     ap.add_argument("--no-history", action="store_true", help="skip the Pattern / Sold Since lookup")
     ap.add_argument("--hide-routine", action="store_true", help="drop routine / regular buyers")
     ap.add_argument("--hide-sold", action="store_true", help="drop buyers who have sold since")
+    ap.add_argument("--exclude-offering", action="store_true", help="drop offering / private-placement buys")
+    ap.add_argument("--exclude-funds", action="store_true", help="drop buys by funds / companies")
+    ap.add_argument("--min-score", type=int, default=0, help="only buys with Signal Score >= N")
     ap.add_argument("--csv", help="write results to this CSV file")
     a = ap.parse_args(argv)
 
@@ -2097,8 +2982,9 @@ def run_cli(argv: list[str]) -> int:
                 rows.extend(payload)
             elif kind == "clusters":
                 clusters.update(payload)
-            elif kind == "history":
-                history.update(payload)
+            elif kind in ("history", "context"):
+                for acc, info in payload.items():
+                    history.setdefault(acc, {}).update(info)
             elif kind in ("phase", "warn"):
                 print(f"[{kind}] {payload}", file=sys.stderr)
             elif kind == "progress" and time.time() - last_print > 2:
@@ -2116,10 +3002,11 @@ def run_cli(argv: list[str]) -> int:
         if r["code"] == "P" and r["acc"] in history:
             r.update(history[r["acc"]])
     rows = apply_signal_filters(rows, clusters, a.exclude_plan, a.clusters, a.min_stake,
-                                a.hide_routine, a.hide_sold)
-    rows.sort(key=lambda r: (r["filing_date"], r["value"]), reverse=True)
+                                a.hide_routine, a.hide_sold, a.exclude_offering, a.exclude_funds, a.min_score)
+    rows.sort(key=lambda r: (r.get("score") or -1, r["value"]), reverse=True)
     for r in rows:
-        print(f"{r['filing_date']}  {r['ticker']:<6} {r['side']:<5} {fmt_money(r['value']):>15}  "
+        sc = "" if r.get("score") is None else r["score"]
+        print(f"{r['filing_date']}  {r['ticker']:<6} score={sc!s:<3} {r['side']:<5} {fmt_money(r['value']):>15}  "
               f"{fmt_stake(r.get('stake')):>9}  cl={r['cluster']:<2} plan={'Y' if r.get('plan') else 'N'}  "
               f"{r['insider'][:26]:<26} {r.get('pattern', '')[:34]:<34} {r.get('sold', '')[:18]:<18} {r['link']}")
     if a.csv:
