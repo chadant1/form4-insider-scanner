@@ -596,7 +596,7 @@ while d <= TODAY:
         pts.append((d, px))
     d += dt.timedelta(days=1)
 pts[-3] = (pts[-3][0], None)                            # a null bar must be skipped
-RESP["https://query1.finance.yahoo.com/v8/finance/chart/SIGL?range=2y&interval=1d&includeAdjustedClose=true"] = yahoo_json(pts)
+RESP["https://query1.finance.yahoo.com/v8/finance/chart/SIGL?range=10y&interval=1d&includeAdjustedClose=true"] = yahoo_json(pts)
 tick = json.loads(RESP[f"{F.SEC_WWW}/files/company_tickers.json"])
 tick["10"] = {"cik_str": SIG, "ticker": "SIGL", "title": "Signal Corp"}
 RESP[f"{F.SEC_WWW}/files/company_tickers.json"] = json.dumps(tick).encode()
@@ -693,7 +693,320 @@ log.clear()
 check("track record clear", log.all() == [])
 log.close()
 
-# 11. Cancel
+# 11. v1.4 live signals: related-owner duplicates, insider record, earnings, fundamentals, liquidity, late
+ERN = 888101
+E_FIL = {}
+_e = [0]
+
+
+def add_ern(owner, txns, d):
+    _e[0] += 1
+    a = f"{ERN:010d}-26-{_e[0]:06d}"
+    E_FIL[a] = (owner, txns, d)
+    return a
+
+
+XO = {"name": "Xavier Owens", "off": "1", "title": "CEO", "cik": "7001"}
+FLP = {"name": "Big Fund LP", "ten": "1", "cik": "7003"}
+FGP = {"name": "Big Fund GP LLC", "ten": "1", "cik": "7004"}
+DIR1 = {"name": "Dana One", "dir": "1", "cik": "7005"}
+DIR2 = {"name": "Evan Two", "dir": "1", "cik": "7006"}
+add_ern(XO, [("P", 1000, 10.0, "A", 1000)], D2 - dt.timedelta(days=400))
+add_ern(XO, [("P", 1000, 12.0, "A", 2000)], D2 - dt.timedelta(days=300))
+XO_CUR = add_ern(XO, [("P", 10000, 12.0, "A", 12000)], D2)
+FLP_ACC = add_ern(FLP, [("P", 50000, 12.0, "A", 950000), ("P", 25000, 12.1, "A", 975000)], D2)
+FGP_ACC = add_ern(FGP, [("P", 50000, 12.0, "A", 950000), ("P", 25000, 12.1, "A", 975000)], D2)
+D1_ACC = add_ern(DIR1, [("P", 1000, 25.0, "A", 5000)], D1)
+D2_ACC = add_ern(DIR2, [("P", 1000, 25.0, "A", 3000)], D1)
+for a_, (owner, txns, d) in E_FIL.items():
+    RESP[f"{F.SEC_WWW}/Archives/edgar/data/{ERN}/{a_}.txt"] = form4(a_, ERN, "Earnings Co", "ERNC", [owner], txns, d)
+EARN_DATE = D2 - dt.timedelta(days=10)
+
+
+def ern_subs(accs, eight_ks=()):
+    accs = sorted(accs, key=lambda a: E_FIL[a][2], reverse=True)
+    return json.dumps({"filings": {"recent": {
+        "accessionNumber": accs + [k[1] for k in eight_ks],
+        "filingDate": [str(E_FIL[a][2]) for a in accs] + [k[0] for k in eight_ks],
+        "form": ["4"] * len(accs) + ["8-K"] * len(eight_ks),
+        "items": [""] * len(accs) + [k[2] for k in eight_ks],
+        "primaryDocument": ["x"] * (len(accs) + len(eight_ks))}, "files": []}}).encode()
+
+
+RESP[f"{F.SEC_DATA}/submissions/CIK{ERN:010d}.json"] = ern_subs(
+    list(E_FIL), [(str(EARN_DATE), "0000888101-26-900001", "2.02,9.01"),
+                  (str(D2 - dt.timedelta(days=40)), "0000888101-26-900002", "5.02")])
+for o in (XO, FLP, FGP, DIR1, DIR2):
+    RESP[f"{F.SEC_DATA}/submissions/CIK{int(o['cik']):010d}.json"] = ern_subs([a_ for a_, v in E_FIL.items() if v[0] is o])
+CC = f"{F.SEC_DATA}/api/xbrl/companyconcept/CIK{ERN:010d}"
+RESP[f"{CC}/dei/EntityCommonStockSharesOutstanding.json"] = json.dumps(
+    {"units": {"shares": [{"end": "2026-09-30", "val": 10_000_000, "filed": "2026-10-30"}]}}).encode()
+RESP[f"{CC}/us-gaap/StockholdersEquity.json"] = json.dumps(
+    {"units": {"USD": [{"end": "2026-09-30", "val": 60_000_000, "filed": "2026-10-30"}]}}).encode()
+RESP[f"{CC}/us-gaap/CashAndCashEquivalentsAtCarryingValue.json"] = json.dumps(
+    {"units": {"USD": [{"end": "2026-09-30", "val": 5_000_000, "filed": "2026-10-30"}]}}).encode()
+RESP[f"{CC}/us-gaap/NetCashProvidedByUsedInOperatingActivities.json"] = json.dumps(
+    {"units": {"USD": [{"start": "2025-01-01", "end": "2025-12-31", "val": -8_000_000, "filed": "2026-02-20"},
+                       {"start": "2026-01-01", "end": "2026-09-30", "val": -1_000_000, "filed": "2026-10-30"}]}}).encode()
+
+
+def yjson(points, vol=10_000):
+    ts = [int(dt.datetime(d.year, d.month, d.day, 14, 30, tzinfo=dt.timezone.utc).timestamp()) for d, _ in points]
+    cl = [c for _, c in points]
+    return json.dumps({"chart": {"result": [{"meta": {"gmtoffset": -18000}, "timestamp": ts,
+                       "indicators": {"quote": [{"close": cl, "volume": [vol] * len(cl)}], "adjclose": [{"adjclose": cl}]}}],
+                       "error": None}}).encode()
+
+
+def series(fn, days=900):
+    out, d = [], TODAY - dt.timedelta(days=days)
+    while d <= TODAY:
+        if d.weekday() < 5:
+            out.append((d, fn(d)))
+        d += dt.timedelta(days=1)
+    return out
+
+
+ern_px = series(lambda d: 10.0 if d < D2 - dt.timedelta(days=350) else (15.0 if d < EARN_DATE else 12.0))
+YURL = "https://query1.finance.yahoo.com/v8/finance/chart/{}?range=10y&interval=1d&includeAdjustedClose=true"
+RESP[YURL.format("ERNC")] = yjson(ern_px)
+RESP[YURL.format("SPY")] = yjson(series(lambda d: 400.0), vol=1_000_000)
+tk_ = json.loads(RESP[f"{F.SEC_WWW}/files/company_tickers.json"])
+tk_["11"] = {"cik_str": ERN, "ticker": "ERNC", "title": "Earnings Co"}
+RESP[f"{F.SEC_WWW}/files/company_tickers.json"] = json.dumps(tk_).encode()
+F.Cache.clear_all()
+
+q = queue.Queue()
+F.Scanner(P(tickers=["ERNC"], codes={"P"}, min_value=0), q, threading.Event()).run()
+erows, einfo, eclu, edups = [], {}, {}, {}
+while not q.empty():
+    _, kind, payload = q.get()
+    if kind == "rows":
+        erows.extend(payload)
+    elif kind in ("history", "context"):
+        for acc, info in payload.items():
+            einfo.setdefault(acc, {}).update(info)
+    elif kind == "clusters":
+        eclu.update(payload)
+    elif kind == "dups":
+        edups.update(payload)
+for r in erows:
+    r.update(einfo.get(r["acc"], {}))
+    r["dup_of"] = edups.get(r["acc"], "")
+F.apply_signal_filters(erows, eclu, False, 0, 0)
+eb = {r["insider"]: r for r in erows}
+X = eb["Xavier Owens"]
+print("\n[11] v1.4 live:")
+print("   dups:", edups, " cluster:", eclu.get(f"{ERN}|P", ())[:2])
+print(f"   Xavier: ins_rec={X.get('ins_rec')} earn={X.get('earn_days')}d {X.get('earn_move')} bm={X.get('bm')} "
+      f"low_cash={X.get('low_cash')} dvol={X.get('dollar_vol')} score={X['score']}")
+print("   " + "\n   ".join(X["score_why"]))
+check("related fund GP filing marked duplicate", set(edups) <= {FLP_ACC, FGP_ACC} and len(edups) == 1)
+check("unrelated directors with identical lots NOT merged", D1_ACC not in edups and D2_ACC not in edups)
+check("cluster counts the fund purchase once", eclu[f"{ERN}|P"][:2] == (4, 4))
+dup_row = eb["Big Fund GP LLC"] if FGP_ACC in edups else eb["Big Fund LP"]
+check("duplicate row capped at 20", dup_row["score"] <= 20 and any("related owner" in w for w in dup_row["score_why"]))
+check("insider record: 2 past buys, +37.5% vs SPY", X["ins_rec"] and X["ins_rec"]["n"] == 2
+      and abs(X["ins_rec"]["avg_ex"] - 37.5) < 1e-6)
+check("insider record factor", any("past buys beat SPY" in w for w in X["score_why"]))
+check("earnings: 10 days after a -20% report", X["earn_days"] == 10 and abs(X["earn_move"] - (-20.0)) < 1e-6
+      and any("after earnings" in w for w in X["score_why"]))
+check("non-earnings 8-K ignored", X["earn_date"] == str(EARN_DATE))
+check("book/market 0.5", abs(X["bm"] - 0.5) < 1e-9 and any("book/market" in w for w in X["score_why"]))
+check("low cash flagged (annual burn > cash)", X["low_cash"] is True and any("cash" in w for w in X["score_why"]))
+check("thin trading flagged (20-day avg $ volume)", 120_000 < X["dollar_vol"] < 150_000
+      and any("thinly traded" in w for w in X["score_why"]))
+check("late filing: none", X["late_days"] == 0)
+check("late business days", (F.late_business_days("2026-11-02", "2026-11-04"), F.late_business_days("2026-11-02", "2026-11-20"),
+                             F.late_business_days("2026-11-06", "2026-11-10")) == (0, 12, 0))
+check("late factor", any("late" in w for w in F.signal_score({"code": "P", "cluster": 1, "late_days": 12})[1]))
+check("weights adjustable", (F.set_weights({"ceo_cfo": 20, "bogus": 5}), F.signal_score({"code": "P", "cluster": 1,
+      "roles_all": [F.ROLE_CEO]})[0])[1] == 60 and F.WEIGHTS["ceo_cfo"] == 20)
+F.set_weights(None)
+check("weights reset", F.WEIGHTS == F.DEFAULT_WEIGHTS)
+check("forward return needs elapsed time", F.forward_return([("2026-01-02", 10, 10, 0)], dt.date(2026, 1, 2), 30) is None)
+check("fact_value annual picks 12-month period",
+      F.fact_value(json.loads(RESP[f"{CC}/us-gaap/NetCashProvidedByUsedInOperatingActivities.json"])["units"]["USD"],
+                   annual=True) == -8_000_000)
+csvrow = F.row_to_csv(X)
+check("CSV has insider record / earnings / late", csvrow[H("Insider Past Buys Measured")] == 2
+      and csvrow[H("Days Since Earnings")] == 10 and len(csvrow) == len(F.CSV_HEADERS))
+
+# 12. Back-test on synthetic SEC quarterly data sets
+import io as _io
+import zipfile as _zip
+
+BT_COLS = {
+    "SUBMISSION": ["ACCESSION_NUMBER", "FILING_DATE", "PERIOD_OF_REPORT", "DATE_OF_ORIG_SUB", "NO_SECURITIES_OWNED",
+                   "NOT_SUBJECT_SEC16", "FORM3_HOLDING_REPORTED", "FORM4_TRANS_REPORTED", "DOCUMENT_TYPE", "ISSUERCIK",
+                   "ISSUERNAME", "ISSUERTRADINGSYMBOL", "REMARKS", "AFF10B5ONE"],
+    "REPORTINGOWNER": ["ACCESSION_NUMBER", "RPTOWNERCIK", "RPTOWNERNAME", "RPTOWNER_RELATIONSHIP", "RPTOWNER_TITLE",
+                       "RPTOWNER_TXT", "RPTOWNER_STREET1", "RPTOWNER_STREET2", "RPTOWNER_CITY", "RPTOWNER_STATE",
+                       "RPTOWNER_ZIPCODE", "RPTOWNER_STATE_DESC", "FILE_NUMBER"],
+    "NONDERIV_TRANS": ["ACCESSION_NUMBER", "NONDERIV_TRANS_SK", "SECURITY_TITLE", "SECURITY_TITLE_FN", "TRANS_DATE",
+                       "TRANS_DATE_FN", "DEEMED_EXECUTION_DATE", "DEEMED_EXECUTION_DATE_FN", "TRANS_FORM_TYPE", "TRANS_CODE",
+                       "EQUITY_SWAP_INVOLVED", "EQUITY_SWAP_TRANS_CD_FN", "TRANS_TIMELINESS", "TRANS_TIMELINESS_FN",
+                       "TRANS_SHARES", "TRANS_SHARES_FN", "TRANS_PRICEPERSHARE", "TRANS_PRICEPERSHARE_FN",
+                       "TRANS_ACQUIRED_DISP_CD", "TRANS_ACQUIRED_DISP_CD_FN", "SHRS_OWND_FOLWNG_TRANS",
+                       "SHRS_OWND_FOLWNG_TRANS_FN", "VALU_OWND_FOLWNG_TRANS", "VALU_OWND_FOLWNG_TRANS_FN",
+                       "DIRECT_INDIRECT_OWNERSHIP", "DIRECT_INDIRECT_OWNERSHIP_FN", "NATURE_OF_OWNERSHIP",
+                       "NATURE_OF_OWNERSHIP_FN"],
+    "FOOTNOTES": ["ACCESSION_NUMBER", "FOOTNOTE_ID", "FOOTNOTE_TXT"],
+}
+
+
+def sec_date(d):
+    return d.strftime("%d-%b-%Y").upper()
+
+
+class BulkQ:
+    def __init__(self):
+        self.t = {k: [] for k in BT_COLS}
+        self.sk = 0
+
+    def filing(self, acc, cik, ticker, owner, rel, title, lots, filed, fn=None, form="4", remarks=""):
+        self.t["SUBMISSION"].append({"ACCESSION_NUMBER": acc, "FILING_DATE": sec_date(filed), "DOCUMENT_TYPE": form,
+                                     "ISSUERCIK": f"{cik:010d}", "ISSUERNAME": f"Co {ticker}",
+                                     "ISSUERTRADINGSYMBOL": ticker, "REMARKS": remarks, "AFF10B5ONE": "0"})
+        self.t["REPORTINGOWNER"].append({"ACCESSION_NUMBER": acc, "RPTOWNERCIK": owner[1], "RPTOWNERNAME": owner[0],
+                                         "RPTOWNER_RELATIONSHIP": rel, "RPTOWNER_TITLE": title})
+        for code, sh, px, td, after in lots:
+            self.sk += 1
+            self.t["NONDERIV_TRANS"].append({"ACCESSION_NUMBER": acc, "NONDERIV_TRANS_SK": str(self.sk),
+                                             "SECURITY_TITLE": "Common Stock", "TRANS_DATE": sec_date(td),
+                                             "TRANS_CODE": code, "TRANS_SHARES": str(sh), "TRANS_PRICEPERSHARE": str(px),
+                                             "TRANS_SHARES_FN": fn or "", "TRANS_ACQUIRED_DISP_CD": "A" if code == "P" else "D",
+                                             "SHRS_OWND_FOLWNG_TRANS": str(after), "DIRECT_INDIRECT_OWNERSHIP": "D"})
+        if fn:
+            self.t["FOOTNOTES"].append({"ACCESSION_NUMBER": acc, "FOOTNOTE_ID": fn,
+                                        "FOOTNOTE_TXT": "Purchased in the underwritten public offering."})
+
+    def zip(self):
+        buf = _io.BytesIO()
+        with _zip.ZipFile(buf, "w") as z:
+            for name, cols in BT_COLS.items():
+                lines = ["\t".join(cols)] + ["\t".join(r.get(c, "") for c in cols) for r in self.t[name]]
+                z.writestr(f"{name}.tsv", "\n".join(lines) + "\n")
+            z.writestr("FORM345_metadata.json", "{}")
+        return buf.getvalue()
+
+
+BQ = {q: BulkQ() for q in ("2024q3", "2024q4", "2025q1", "2025q2")}
+n_acc = [0]
+
+
+def bacc():
+    n_acc[0] += 1
+    return f"0009{n_acc[0]:06d}-25-{n_acc[0]:06d}"
+
+
+EXPECT = {"signals": 0, "cluster_rows": 0}
+for i in range(60):
+    q_ = "2025q1" if i < 30 else "2025q2"
+    base = dt.date(2025, 1, 6) if i < 30 else dt.date(2025, 4, 7)
+    d = base + dt.timedelta(days=(i % 30) * 2)
+    cik, tic = 900000 + i, f"T{i:03d}"
+    BQ[q_].filing(bacc(), cik, tic, (f"Person{i} Alpha", f"{50000 + i}"), "Officer", "CEO",
+                  [("P", 10000, 10.0, d, 20000)], d)
+    EXPECT["signals"] += 1
+    if i % 2 == 0:            # a second insider joins within days -> cluster; these stocks go up 20%
+        BQ[q_].filing(bacc(), cik, tic, (f"Other{i} Beta", f"{60000 + i}"), "Director", "",
+                      [("P", 10000, 10.0, d + dt.timedelta(days=2), 15000)], d + dt.timedelta(days=2))
+        EXPECT["signals"] += 1
+    if i == 7:                # a sale in the warm-up period by another insider
+        BQ["2024q4"].filing(bacc(), cik, tic, ("Seller Seven", "70007"), "Officer", "CFO",
+                            [("S", 5000, 9.0, dt.date(2024, 11, 4), 1000)], dt.date(2024, 11, 5))
+# fund + GP report the same purchase separately (the GP's copy must be dropped)
+BQ["2025q1"].filing(bacc(), 900100, "T100", ("Delta Fund LP", "80001"), "TenPercentOwner", "",
+                    [("P", 40000, 10.0, dt.date(2025, 2, 3), 400000), ("P", 10000, 10.2, dt.date(2025, 2, 4), 410000)],
+                    dt.date(2025, 2, 5))
+BQ["2025q1"].filing(bacc(), 900100, "T100", ("Delta Fund GP LLC", "80002"), "TenPercentOwner", "",
+                    [("P", 40000, 10.0, dt.date(2025, 2, 3), 400000), ("P", 10000, 10.2, dt.date(2025, 2, 4), 410000)],
+                    dt.date(2025, 2, 5))
+EXPECT["signals"] += 1
+# an offering buy (footnote) and a Form 3 that must be ignored
+BQ["2025q2"].filing(bacc(), 900101, "T101", ("Olga Offer", "80003"), "Director", "",
+                    [("P", 20000, 10.0, dt.date(2025, 5, 5), 20000)], dt.date(2025, 5, 6), fn="F1")
+EXPECT["signals"] += 1
+BQ["2025q2"].filing(bacc(), 900102, "T102", ("New Guy", "80004"), "Officer", "CEO",
+                    [("P", 99999, 10.0, dt.date(2025, 5, 5), 99999)], dt.date(2025, 5, 6), form="3")
+# warm-up: an earlier buy by Person1 (pattern = opportunistic)
+BQ["2024q3"].filing(bacc(), 900001, "T001", ("Person1 Alpha", "50001"), "Officer", "CEO",
+                    [("P", 1000, 8.0, dt.date(2024, 8, 1), 10000)], dt.date(2024, 8, 2))
+# look-ahead guard: T005's second buyer trades in the window but files 40 days later
+BQ["2025q1"].filing(bacc(), 900005, "T005", ("Late Larry", "80005"), "Director", "",
+                    [("P", 10000, 10.0, dt.date(2025, 1, 17), 10000)], dt.date(2025, 2, 28))
+EXPECT["signals"] += 1
+
+for q_, bq in BQ.items():
+    url = F.BULK_URLS[0 if q_ >= "2025q1" else 1].format(q=q_)      # older quarters only at the second address
+    RESP[url] = bq.zip()
+for i in list(range(60)) + [100, 101]:
+    tic, up = f"T{i:03d}", (i % 2 == 0 and i < 60)
+    RESP[YURL.format(tic)] = yjson(series(lambda d, up=up: 12.0 if (up and d > dt.date(2025, 6, 30) or
+                                                                    up and d.year == 2025 and d.month in (2, 3, 5, 6)
+                                                                    and False) else 10.0, days=700),
+                                   vol=100_000)
+# rising stocks: +20% three months after each filing
+for i in range(0, 60, 2):
+    tic = f"T{i:03d}"
+    base = dt.date(2025, 1, 6) if i < 30 else dt.date(2025, 4, 7)
+    jump = base + dt.timedelta(days=(i % 30) * 2 + 20)
+    RESP[YURL.format(tic)] = yjson(series(lambda d, j=jump: 12.0 if d >= j else 10.0, days=700), vol=100_000)
+for per in {F.frame_period_instant(dt.date(2025, m, 15)) for m in range(1, 13)}:
+    RESP[f"{F.SEC_DATA}/api/xbrl/frames/dei/EntityCommonStockSharesOutstanding/shares/{per}.json"] = json.dumps(
+        {"data": [{"cik": 900000 + i, "val": 1_000_000} for i in range(103)]}).encode()
+
+CALLS.clear()
+bq_ = queue.Queue()
+F.Backtester(F.BacktestParams("2025q1", "2025q2", "Test test@example.com", warmup_quarters=2, min_value=50_000,
+                              max_signals=0, company_data=True), bq_, threading.Event()).run()
+res, berr = None, None
+while not bq_.empty():
+    _, kind, payload = bq_.get()
+    if kind == "bt_done":
+        res = payload
+    elif kind == "error":
+        berr = payload
+print("\n[12] back-test:", berr or {k: res[k] for k in ("filings", "candidates", "signals", "priced6", "dups", "missing_quarters")})
+check("back-test ran", res is not None)
+rows_bt = {(r["ticker"], r["insider"]): r for r in res["rows"]}
+cl = next(f for f in res["factors"] if f["key"] == "cluster2")
+print(f"   cluster2: n={cl['n_with']} with={cl['with']:.1f} without={cl['without']:.1f} suggested={cl['suggested']}")
+print("   bands:", {b: (v["n"], None if v["ex6M"] is None else round(v["ex6M"], 1)) for b, v in res["bands"].items()})
+check("bulk files: both SEC addresses tried, none missing", res["missing_quarters"] == [])
+check("Form 3 ignored; all expected signals", res["signals"] == EXPECT["signals"])
+check("fund GP duplicate removed", res["dups"] == 1 and ("T100", "Delta Fund GP LLC") not in rows_bt)
+check("offering footnote parsed", rows_bt[("T101", "Olga Offer")]["offering"] is True)
+check("6-month results for all priced", res["priced6"] == res["signals"])
+check("cluster rows +20% vs SPY", abs(rows_bt[("T000", "Person0 Alpha")]["ex6M"] - 20.0) < 1e-6)
+# first buyers in rising stocks weren't a cluster yet when they filed (no look-ahead), so uplift ~ +10
+check("cluster factor uplift measured -> suggested points", cl["uplift"] > 5 and cl["suggested"] == round(cl["uplift"]))
+check("weights only suggested where the training half has 30+ signals each way",
+      "cluster2" not in res["suggested"] and all(f["n_with"] >= 30 for f in F.factor_stats(
+          [r for r in res["rows"] if r.get("ex6M") is not None][:res["priced6"] // 2]) if f["enough"]))
+check("no look-ahead: late-filed buyer not in earlier cluster", rows_bt[("T005", "Person5 Alpha")]["cluster"] == 1)
+check("pattern from warm-up history", rows_bt[("T001", "Person1 Alpha")]["pattern_kind"] == "opp")
+check("net flow includes a warm-up-period sale within 90 days", rows_bt[("T007", "Person7 Alpha")]["net90"]["sell"] == 45000
+      and rows_bt[("T009", "Person9 Alpha")]["net90"]["sell"] == 0)
+check("market cap from XBRL frame", abs(rows_bt[("T002", "Person2 Alpha")]["mcap"] - 10_000_000) < 1)
+check("train/test results present", res["test_current"]["All"]["n"] > 0 and res["split_date"])
+check("frames requested", any("/api/xbrl/frames/" in u for u in CALLS))
+check("bulk zip cached on disk", os.path.exists(os.path.join(F.app_data_dir(), "bulk", "2025q1_form345.zip")))
+CALLS.clear()
+bq_ = queue.Queue()
+F.Backtester(F.BacktestParams("2025q1", "2025q2", "Test test@example.com", warmup_quarters=2, min_value=50_000,
+                              max_signals=10, company_data=False), bq_, threading.Event()).run()
+res2 = next(p_ for _, k, p_ in list(bq_.queue) if k == "bt_done")
+check("re-run uses cached zips & prices; sample size respected",
+      not any("insider-transactions" in u or "finance.yahoo" in u for u in CALLS) and res2["signals"] == 10)
+check("bt CSV row", len(F.bt_row_csv(res["rows"][0])) == len(F.BT_CSV_HEADERS))
+check("quarter helpers", (F.shift_quarter("2025q1", -2), F.quarter_range("2024q4", "2025q2"),
+                          F.quarter_bounds("2024q4")[1], F.bulk_date("05-JAN-2024")) ==
+      ("2024q3", ["2024q4", "2025q1", "2025q2"], dt.date(2024, 12, 31), "2024-01-05"))
+check("default back-test period", F.default_backtest_quarters(dt.date(2026, 11, 20)) == ("2025q2", "2026q1"))
+
+# 13. Cancel
 q = queue.Queue(); ev = threading.Event(); ev.set()
 F.Scanner(P(), q, ev).run()
 kinds = [k for _, k, _ in list(q.queue)]

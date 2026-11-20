@@ -8,6 +8,8 @@ _h = _src.split("HIST = 424242", 1)[1].split("CALLS.clear()")[0]   # history fix
 exec("HIST = 424242" + _h)
 _g = _src.split("SIG = 777001", 1)[1].split("F.Cache.clear_all()")[0]   # v1.3 fixtures (company SIGL)
 exec("SIG = 777001" + _g)
+exec("ERN = 888101" + _src.split("ERN = 888101", 1)[1].split("F.Cache.clear_all()")[0])      # v1.4 live fixtures
+exec("import io as _io" + _src.split("import io as _io", 1)[1].split("CALLS.clear()\nbq_")[0])  # back-test fixtures
 import tkinter as tk
 import webbrowser
 opened = []
@@ -27,7 +29,7 @@ def mainloop(self, n=0):
         app.apply_preset()
         print("PRESET:", app.status_var.get())
         app.min_var.set("0"); app.code_vars["S"].set(True)
-        app.tickers_var.set("SIGL, HIST, NVDA, MSFT, AAPL")
+        app.tickers_var.set("ERNC, SIGL, HIST, NVDA, MSFT")
         app.cluster_only_var.set(False); app.min_stake_var.set("0"); app.excl_plan_var.set(False)
         app.hide_routine_var.set(False); app.hide_sold_var.set(False)
         self.state("normal"); self.geometry("1900x950+0+0")
@@ -62,6 +64,25 @@ def mainloop(self, n=0):
         print("CLUSTERS-ONLY:", [(r["ticker"], r["insider"], r["cluster"], r["plan"]) for r in vis])
         app.cluster_only_var.set(False); app.min_stake_var.set("20"); app._view_changed()
         self.after(400, lambda: step4(app))
+    def step_bt(app):
+        app.show_backtest()
+        bw = app._bt_win
+        bw.start_var.set("2025Q1"); bw.end_var.set("2025Q2"); bw.warm_var.set(2)
+        bw.min_var.set("50000"); bw.max_var.set("0")
+        bw.run()
+        def wait():
+            if bw.result is None and str(bw.run_btn.cget("state")) == "disabled":
+                self.after(500, wait)
+                return
+            self.update(); shot("5_backtest_bands")
+            print("BT STATUS:", bw.status.get())
+            print("BT SUMMARY:", bw.summary.get())
+            nb = bw.t_factors.master.master
+            nb.select(1); self.update(); shot("6_backtest_factors")
+            nb.select(2); self.update(); shot("7_backtest_test")
+            self.after(300, self.destroy)
+        self.after(1000, wait)
+
     def step4(app):
         vis = [app.rows[i] for i in app.tree.get_children()]
         print("STAKE>=20:", sorted((r["ticker"], F.fmt_stake(r["stake"])) for r in vis))
@@ -69,7 +90,8 @@ def mainloop(self, n=0):
         print("SORT STAKE:", [F.fmt_stake(app.rows[i]["stake"]) for i in app.tree.get_children()])
         iid = app.tree.get_children()[0]; app.tree.selection_set(iid); app.filter_to_ticker()
         print("ONE TICKER:", {app.rows[i]["ticker"] for i in app.tree.get_children()}, app.summary_var.get())
-        self.after(300, self.destroy)
+        app.clear_ticker_filter(); app.min_stake_var.set("0"); app._view_changed()
+        self.after(300, lambda: step_bt(app))
     self.after(800, go)
     orig_mainloop(self, n)
 
