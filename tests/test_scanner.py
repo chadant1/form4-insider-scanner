@@ -399,7 +399,128 @@ check("exclude plan drops AAPL sale + planned buy", not any(r["plan"] for r in o
 csvrow = F.row_to_csv(by[("TBIO", "Big Fund LP; Big Fund GP LLC")])
 check("CSV has stake/cluster/plan", csvrow[11] == "New position" and csvrow[14] == "No" and len(csvrow) == len(F.CSV_HEADERS))
 
-# 9. Cancel
+# 9. Insider history: buying pattern + later sales (ticker mode, company HIST)
+HIST = 424242
+H_FILINGS = {}   # acc -> (owner dict, txns, date, issuer cik)
+_n = [0]
+
+
+def hacc(issuer=HIST):
+    _n[0] += 1
+    return f"{issuer:010d}-2{_n[0] % 10}-{_n[0]:06d}"
+
+
+def add_hist(owner, txns, d, issuer=HIST):
+    a = hacc(issuer)
+    H_FILINGS[a] = (owner, txns, d, issuer)
+    return a
+
+
+RITA = {"name": "Routine Rita", "off": "1", "title": "COO", "cik": "5001"}
+QUINN = {"name": "Quarterly Quinn", "dir": "1", "cik": "5002"}
+FRED = {"name": "Fresh Fred", "dir": "1", "cik": "5003"}
+FLO = {"name": "Flipper Flo", "off": "1", "title": "CEO", "cik": "5004"}
+TOM = {"name": "Taxed Tom", "off": "1", "title": "CFO", "cik": "5005"}
+CUR = {}
+for k in (1, 2, 3):                                   # Rita: same time every year for 3 years
+    add_hist(RITA, [("P", 500, 20.0, "A", 10000 - 500 * (3 - k))], F._years_ago(D2, k) + dt.timedelta(days=5))
+add_hist(RITA, [("P", 900, 21.0, "A", 9000)], F._years_ago(D2, 2) + dt.timedelta(days=5), issuer=999998)  # other company
+CUR["rita"] = add_hist(RITA, [("P", 2000, 30.0, "A", 12000)], D2)
+for days in (80, 170, 260, 350):                      # Quinn: roughly quarterly
+    add_hist(QUINN, [("P", 300, 25.0, "A", 4000)], D2 - dt.timedelta(days=days))
+CUR["quinn"] = add_hist(QUINN, [("P", 3000, 30.0, "A", 8000)], D2)
+add_hist(FRED, [("S", 1000, 15.0, "D", 3000)], F._years_ago(D2, 2))      # an old SALE, no buys
+CUR["fred"] = add_hist(FRED, [("P", 5000, 30.0, "A", 8000)], D2)
+add_hist(FLO, [("P", 100, 12.0, "A", 4000)], F._years_ago(D2, 2) - dt.timedelta(days=100))
+CUR["flo"] = add_hist(FLO, [("P", 1000, 30.0, "A", 5000)], D2)
+add_hist(FLO, [("S", 2000, 33.0, "D", 3000)], D1)                         # sells 40% days later
+CUR["tom"] = add_hist(TOM, [("P", 1500, 30.0, "A", 6000)], D2)
+add_hist(TOM, [("F", 200, 31.0, "D", 5800)], D1)                          # tax withholding only
+
+for a, (owner, txns, d, iss) in H_FILINGS.items():
+    RESP[f"{F.SEC_WWW}/Archives/edgar/data/{iss}/{a}.txt"] = form4(
+        a, iss, "Hist Co" if iss == HIST else "Other Co", "HIST" if iss == HIST else "OTHR", [owner], txns, d)
+
+
+def subs_json(accs):
+    accs = sorted(accs, key=lambda a: H_FILINGS[a][2], reverse=True)
+    return json.dumps({"filings": {"recent": {
+        "accessionNumber": accs, "filingDate": [str(H_FILINGS[a][2]) for a in accs],
+        "form": ["4"] * len(accs), "primaryDocument": ["x.xml"] * len(accs)}, "files": []}}).encode()
+
+
+RESP[f"{F.SEC_DATA}/submissions/CIK{HIST:010d}.json"] = subs_json([a for a, v in H_FILINGS.items() if v[3] == HIST])
+for o in (RITA, QUINN, FRED, FLO, TOM):
+    RESP[f"{F.SEC_DATA}/submissions/CIK{int(o['cik']):010d}.json"] = subs_json(
+        [a for a, v in H_FILINGS.items() if v[0] is o])
+tickers = json.loads(RESP[f"{F.SEC_WWW}/files/company_tickers.json"])
+tickers["9"] = {"cik_str": HIST, "ticker": "HIST", "title": "Hist Co"}
+RESP[f"{F.SEC_WWW}/files/company_tickers.json"] = json.dumps(tickers).encode()
+F.Cache.clear_all()                                   # ticker list is cached - reload it
+
+CALLS.clear()
+q = queue.Queue()
+F.Scanner(P(tickers=["HIST"], codes={"P"}, min_value=0), q, threading.Event()).run()
+hrows, hist, kinds = [], {}, []
+while not q.empty():
+    _, kind, payload = q.get()
+    kinds.append(kind)
+    if kind == "rows":
+        hrows.extend(payload)
+    elif kind == "history":
+        hist.update(payload)
+for r in hrows:
+    r.update(hist.get(r["acc"], {}))
+hb = {r["insider"]: r for r in hrows}
+print("\n[9] history:")
+for r in hrows:
+    print(f"   {r['insider']:<16} {r['pattern']:<40} {r['sold']}")
+check("history rows for all 5 buyers", sorted(hb) == ["Flipper Flo", "Fresh Fred", "Quarterly Quinn", "Routine Rita", "Taxed Tom"])
+check("history posted before done", "history" in kinds and kinds.index("history") < kinds.index("done"))
+check("Rita = routine", hb["Routine Rita"]["pattern_kind"] == "routine")
+check("Quinn = regular (quarterly)", hb["Quarterly Quinn"]["pattern_kind"] == "regular")
+check("Fred = first buy (old sale ignored)", hb["Fresh Fred"]["pattern_kind"] == "first" and hb["Fresh Fred"]["pattern"] == "First buy in 5+ yrs")
+check("Flo = opportunistic", hb["Flipper Flo"]["pattern_kind"] == "opp" and hb["Flipper Flo"]["pattern"].startswith("Opportunistic (last "))
+check("Flo sold 40% since", hb["Flipper Flo"]["sold_kind"] == "sold" and abs(hb["Flipper Flo"]["sold_pct"] - 40.0) < 1e-9
+      and hb["Flipper Flo"]["sold"].startswith("Sold 40% ("))
+check("Tom: tax withholding is not a sale", hb["Taxed Tom"]["sold_kind"] == "tax")
+check("Rita/Quinn/Fred not sold", all(hb[n]["sold_kind"] == "none" for n in ("Routine Rita", "Quarterly Quinn", "Fresh Fred")))
+other = [a for a, v in H_FILINGS.items() if v[3] == 999998][0]
+check("other-company filing never fetched", not any(other in u for u in CALLS))
+check("routine buyer's other-company buy ignored", hb["Routine Rita"]["pattern_kind"] == "routine")
+out = F.apply_signal_filters([dict(r) for r in hrows], {}, False, 0, 0, hide_routine=True)
+check("hide routine/regular", sorted(r["insider"] for r in out) == ["Flipper Flo", "Fresh Fred", "Taxed Tom"])
+out = F.apply_signal_filters([dict(r) for r in hrows], {}, False, 0, 0, hide_routine=True, hide_sold=True)
+check("hide routine + sold", sorted(r["insider"] for r in out) == ["Fresh Fred", "Taxed Tom"])
+csvrow = F.row_to_csv(hb["Flipper Flo"])
+check("CSV pattern/sold columns", csvrow[F.CSV_HEADERS.index("Sold % of Holding")] == 40.0
+      and csvrow[F.CSV_HEADERS.index("Pattern")].startswith("Opportunistic") and len(csvrow) == len(F.CSV_HEADERS))
+
+# second run: history served from cache (no new filing downloads)
+CALLS.clear()
+q = queue.Queue()
+F.Scanner(P(tickers=["HIST"], codes={"P"}, min_value=0), q, threading.Event()).run()
+check("history re-run uses cache", not any(u.endswith(".txt") for u in CALLS)
+      and not any(f"CIK{5001:010d}" in u for u in CALLS))
+
+# history off -> no extra requests, rows not pending
+CALLS.clear()
+F.Cache.clear_all()
+rows_nh, _ = run(P(tickers=["HIST"], codes={"P"}, min_value=0, check_history=False))
+check("history off: no owner lookups", not any(f"CIK{5001:010d}" in u for u in CALLS)
+      and all(r["pattern_kind"] == "na" for r in rows_nh))
+
+# pattern unit checks
+d0 = dt.date(2026, 11, 10)
+check("buy 2 weeks earlier = same spree -> first", F.classify_pattern(d0, [d0 - dt.timedelta(days=14)])[0] == "first")
+check("2 of 3 years -> regular", F.classify_pattern(d0, [dt.date(2025, 11, 1), dt.date(2024, 11, 20)])[0] == "regular")
+check("Feb 29 safe", F._years_ago(dt.date(2024, 2, 29), 1) == dt.date(2023, 2, 28))
+check("later sale before buy date ignored", F.classify_later_sales(
+    d0, [{"txns": [{"t": "N", "code": "S", "sh": 100, "date": "2026-11-01"}]}], 1000)[0] == "none")
+check("sale without holdings -> share count", F.classify_later_sales(
+    d0, [{"txns": [{"t": "N", "code": "S", "sh": 100, "date": "2026-11-12"}]}], None)[1] == "Sold 100 sh (Nov 12)")
+
+# 10. Cancel
 q = queue.Queue(); ev = threading.Event(); ev.set()
 F.Scanner(P(), q, ev).run()
 kinds = [k for _, k, _ in list(q.queue)]

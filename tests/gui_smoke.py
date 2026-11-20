@@ -2,7 +2,10 @@
 import os, subprocess, sys, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = sys.argv[1] if len(sys.argv) > 1 else "/tmp"
-exec(open(os.path.join(HERE, "test_scanner.py")).read().split("# 1. Market-wide default")[0])
+_src = open(os.path.join(HERE, "test_scanner.py")).read()
+exec(_src.split("# 1. Market-wide default")[0])                     # fixtures + mocked SEC
+_h = _src.split("HIST = 424242", 1)[1].split("CALLS.clear()")[0]   # history fixtures (company HIST)
+exec("HIST = 424242" + _h)
 import tkinter as tk
 import webbrowser
 opened = []
@@ -21,15 +24,25 @@ def mainloop(self, n=0):
         app.ua_var.set("Jane Doe jane@example.com")
         app.apply_preset()
         print("PRESET:", app.status_var.get())
-        app.min_var.set("50000"); app.code_vars["S"].set(True)
+        app.min_var.set("0"); app.code_vars["S"].set(True)
+        app.tickers_var.set("HIST, NVDA, MSFT, AAPL")
         app.cluster_only_var.set(False); app.min_stake_var.set("0"); app.excl_plan_var.set(False)
+        app.hide_routine_var.set(False); app.hide_sold_var.set(False)
+        self.state("normal"); self.geometry("1900x950+0+0")
         app._view_changed()
         app.start_scan()
-        self.after(8000, lambda: step2(app))
+        self.after(14000, lambda: step2(app))
     def step2(app):
-        app.sort_by("value")
+        app.sort_by("pattern")
         self.update(); shot("1_all_rows")
+        print("PATTERNS:", sorted((r["insider"], r["pattern"], r["sold"]) for r in app.rows.values() if r["code"] == "P"))
         print("ALL:", app.summary_var.get())
+        app.hide_routine_var.set(True); app.hide_sold_var.set(True); app._view_changed()
+        self.after(400, lambda: step2b(app))
+    def step2b(app):
+        self.update(); shot("1b_hide_routine_sold")
+        print("HIDE ROUTINE+SOLD:", sorted(app.rows[i]["insider"] for i in app.tree.get_children()))
+        app.hide_routine_var.set(False); app.hide_sold_var.set(False)
         app.excl_plan_var.set(True); app.cluster_only_var.set(True); app._view_changed()
         self.after(400, lambda: step3(app))
     def step3(app):
