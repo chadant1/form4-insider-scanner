@@ -40,7 +40,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 APP_NAME = "SEC Form 4 Insider Scanner"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 SEC_WWW = "https://www.sec.gov"
 SEC_DATA = "https://data.sec.gov"
@@ -50,7 +50,7 @@ HISTORY_YEARS = 5                    # how far back to look for an insider's ear
 CONTEXT_DAYS = 90                    # window for "what other insiders did" and recent 13D filings
 PRICE_RPS = 3                        # Yahoo Finance requests per second
 BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36"
-CACHE_VERSION = 3                    # bump if the parsed-record format changes
+CACHE_VERSION = 4                    # bump if the parsed-record format changes
 
 # ----------------------------------------------------------------------------
 # Insider-role matching (case-insensitive, on officer title + relationship text)
@@ -322,6 +322,16 @@ ENTITY_RE = re.compile(
     r"Company|Co\.|AG|GmbH|S\.A\.|N\.V\.|PLC|Foundation|Endowment|Bank|Trust\s+Company)(?=\W|$)", re.I)
 
 
+# Footnotes that explain a sale as non-discretionary (taxes, estate planning, divorce, gifts ...)
+EXPLAINED_RE = re.compile(
+    r"\btax(?:es)?\b|withh?olding|sell[- ]to[- ]cover|to cover (?:the )?(?:exercise|strike|tax)|exercise price|"
+    r"estate[- ]planning|divorce|domestic relations|charit|donat|\bgift|tuition|mortgage|"
+    r"purchase (?:of )?(?:a |his |her |their )?(?:home|house|residence)|personal (?:financial |liquidity )?(?:planning|needs)|"
+    r"diversif|margin (?:call|loan)|pledge|settlement of (?:restricted|performance|RSU)|"
+    r"in connection with the (?:vesting|settlement)|upon (?:the )?vesting|vesting of (?:restricted|performance|RSU)",
+    re.I)
+
+
 def is_entity(name: str) -> bool:
     return bool(ENTITY_RE.search(name or ""))
 
@@ -340,13 +350,15 @@ def parse_ownership_xml(xml_bytes: bytes, record: dict) -> dict:
     record["schema"] = _txt(root, "schemaVersion")
     # Form 4 checkbox (since 2023): "transaction made pursuant to a 10b5-1 plan"
     record["plan10b5"] = _flag(root, "aff10b5One")
-    plan_notes, offer_notes = [], []
+    plan_notes, offer_notes, explain_notes = [], [], []
     for fn in root.findall("footnotes/footnote"):
         text = " ".join("".join(fn.itertext()).split())
         if PLAN_RE.search(text) and not NOT_PLAN_RE.search(text):
             plan_notes.append(fn.get("id", ""))
         if OFFERING_RE.search(text):
             offer_notes.append(fn.get("id", ""))
+        if EXPLAINED_RE.search(text):
+            explain_notes.append(fn.get("id", ""))
     remarks = " ".join(_txt(root, "remarks").split())
     record["offering_doc"] = bool(OFFERING_RE.search(remarks))
     if not record.get("form"):
@@ -387,6 +399,7 @@ def parse_ownership_xml(xml_bytes: bytes, record: dict) -> dict:
                 "nat": _val(t, "ownershipNature/natureOfOwnership"),
                 "plan": bool(set(_footnote_ids(t)) & set(plan_notes)),
                 "offer": bool(set(_footnote_ids(t)) & set(offer_notes)),
+                "explained": bool(set(_footnote_ids(t)) & set(explain_notes)),
             })
     record["txns"] = txns
     return record
@@ -885,9 +898,41 @@ FACTORS = {
     "late": (-4, "Form 4 filed more than 10 business days late"),
     "thin": (-5, "thinly traded (under $250k a day)"),
 }
-DEFAULT_WEIGHTS = {k: v[0] for k, v in FACTORS.items()}
+# Sell Score: higher = stronger warning. Research: only large sales relative to holdings, and
+# unexplained / discretionary ones, have carried negative information on average.
+SELL_FACTORS = {
+    "s_all": (22, "sold the entire position"),
+    "s_pct50": (15, "sold 50%+ of the holding"),
+    "s_pct25": (8, "sold 25%+ of the holding"),
+    "s_small": (-8, "sold under 5% of the holding"),
+    "s_discretionary": (8, "discretionary: no plan and no explanation given"),
+    "s_explained": (-10, "explained in a footnote (taxes, estate planning, gifts ...)"),
+    "s_plan": (-12, "made under a 10b5-1 plan"),
+    "s_exercise": (-12, "exercise-and-sell of options the same day"),
+    "s_ceo_cfo": (8, "CEO or CFO is the seller"),
+    "s_director": (3, "director is the seller"),
+    "s_val1m": (4, "sale of $1M or more"),
+    "s_val5m": (8, "sale of $5M or more"),
+    "s_first": (10, "first open-market sale in 5+ years"),
+    "s_opp": (6, "opportunistic seller (no selling schedule)"),
+    "s_regular": (-8, "regular seller (on a schedule)"),
+    "s_routine": (-15, "routine seller (same time every year)"),
+    "s_cluster2": (2, "2 different insiders selling"),
+    "s_cluster3": (4, "3+ different insiders selling"),
+    "s_runup": (5, "stock up 30%+ in the 3 months before the sale"),
+    "s_near_high": (4, "sold within 5% of the 52-week high"),
+    "s_late_qtr": (5, "sold late in the quarter, ahead of the next earnings report"),
+    "s_net_sell": (4, "insiders were heavy net sellers over 90 days"),
+    "s_net_buy": (-4, "insiders net buyers over 90 days"),
+    "s_entity": (-8, "seller is a fund or company, not a person"),
+    "s_offering": (-15, "sold in a registered / underwritten offering"),
+    "s_late": (3, "Form 4 filed more than 10 business days late"),
+}
+ALL_FACTORS = {**FACTORS, **SELL_FACTORS}
+DEFAULT_WEIGHTS = {k: v[0] for k, v in ALL_FACTORS.items()}
 WEIGHTS = dict(DEFAULT_WEIGHTS)
 SCORE_BASE = 40
+SELL_BASE = 30
 
 
 def set_weights(custom: dict | None) -> None:
@@ -1047,6 +1092,114 @@ def signal_score(r: dict, weights: dict | None = None) -> tuple[int | None, list
     return max(0, min(100, int(round(pts)))), why
 
 
+def sell_factors(r: dict) -> list[tuple[str, str]]:
+    """Which sell factors apply to a sale row -> [(key, readable label)]."""
+    f: list[tuple[str, str]] = []
+
+    def on(key: str, label: str | None = None) -> None:
+        f.append((key, label or SELL_FACTORS[key][1]))
+
+    st = r.get("stake")
+    if st is not None:
+        if st <= -99.5:
+            on("s_all")
+        elif st <= -50:
+            on("s_pct50", f"sold {abs(st):.0f}% of the holding")
+        elif st <= -25:
+            on("s_pct25", f"sold {abs(st):.0f}% of the holding")
+        elif st > -5:
+            on("s_small", f"sold {abs(st):.1f}% of the holding")
+    if r.get("plan"):
+        on("s_plan")
+    if r.get("explained"):
+        on("s_explained")
+    if r.get("exercise_sell"):
+        on("s_exercise")
+    if not (r.get("plan") or r.get("explained") or r.get("exercise_sell") or r.get("offering")):
+        on("s_discretionary")
+    roles = set(r.get("roles_all") or [])
+    if ROLE_CEO in roles or ROLE_CFO in roles:
+        on("s_ceo_cfo")
+    elif ROLE_DIR in roles and not r.get("entity"):
+        on("s_director")
+    v = r.get("value") or 0
+    if v >= 5_000_000:
+        on("s_val5m")
+    elif v >= 1_000_000:
+        on("s_val1m")
+    pk = r.get("pattern_kind")
+    if pk in ("first", "opp", "regular", "routine"):
+        on("s_" + pk)
+    n = int(r.get("cluster", 1) or 1)
+    if n >= 3:
+        on("s_cluster3", f"{n} different insiders selling")
+    elif n == 2:
+        on("s_cluster2")
+    c3 = r.get("chg3m")
+    if c3 is not None and c3 >= 30:
+        on("s_runup", f"stock up {c3:.0f}% in the 3 months before the sale")
+    oh = r.get("off_high")
+    if oh is not None and oh >= -5:
+        on("s_near_high")
+    ds = r.get("earn_days")
+    if ds is not None and 60 <= ds <= 100:
+        on("s_late_qtr", f"sold {ds} days after the last earnings report (late in the quarter)")
+    fl = r.get("net90")
+    if fl:
+        if fl["sell"] >= 250_000 and fl["sell"] > 3 * max(fl["buy"], 1.0):
+            on("s_net_sell")
+        elif fl["buy"] > fl["sell"]:
+            on("s_net_buy")
+    if r.get("entity"):
+        on("s_entity")
+    if r.get("offering"):
+        on("s_offering")
+    if (r.get("late_days") or 0) > 10:
+        on("s_late", f"Form 4 filed {r['late_days']} business days late")
+    return f
+
+
+def sell_score(r: dict, weights: dict | None = None) -> tuple[int | None, list]:
+    """0-100 warning score for an open-market sale (higher = more likely informative), with reasons."""
+    if r.get("code") != "S":
+        return None, []
+    w = WEIGHTS if weights is None else weights
+    pts, why = SELL_BASE, []
+    for key, label in sell_factors(r):
+        n = w.get(key, 0)
+        if n:
+            pts += n
+            why.append(f"{n:+d}  {label}")
+    caps = []
+    if r.get("offering"):
+        caps.append((30, "sold in an offering"))
+    if r.get("exercise_sell"):
+        caps.append((40, "exercise-and-sell"))
+    if r.get("plan"):
+        caps.append((45, "10b5-1 plan sale"))
+    if r.get("explained"):
+        caps.append((45, "explained sale"))
+    if r.get("pattern_kind") == "routine":
+        caps.append((45, "routine seller"))
+    if r.get("dup_of"):
+        caps.append((20, "same sale already reported by a related owner"))
+    for cap, text in sorted(caps):
+        if pts > cap:
+            why.append(f"capped at {cap}: {text}")
+            pts = cap
+            break
+    return max(0, min(100, int(round(pts)))), why
+
+
+def rate_row(r: dict, weights: dict | None = None) -> tuple[int | None, list]:
+    """Signal Score for buys, Sell Score for sales, nothing for other codes."""
+    if r.get("code") == "P":
+        return signal_score(r, weights)
+    if r.get("code") == "S":
+        return sell_score(r, weights)
+    return None, []
+
+
 # ----------------------------------------------------------------------------
 # Track record of signals (kept even if the download cache is cleared)
 # ----------------------------------------------------------------------------
@@ -1056,19 +1209,24 @@ class SignalLog:
         self.conn.execute("""CREATE TABLE IF NOT EXISTS signals (
             acc TEXT PRIMARY KEY, ticker TEXT, company TEXT, insider TEXT, buy_date TEXT,
             price REAL, value REAL, score INTEGER, first_seen TEXT, pattern TEXT, cluster INTEGER)""")
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(signals)")}
+        if "side" not in cols:                       # v1.5: sales are logged too
+            self.conn.execute("ALTER TABLE signals ADD COLUMN side TEXT DEFAULT 'P'")
         self.conn.commit()
 
     def log(self, rows: list) -> int:
         n = 0
         today = dt.date.today().isoformat()
         for r in rows:
-            if r.get("code") != "P" or r.get("score") is None or not r.get("ticker"):
+            if r.get("code") not in ("P", "S") or r.get("score") is None or not r.get("ticker") or r.get("dup_of"):
                 continue
+            key = r["acc"] if r["code"] == "P" else f"{r['acc']}|S"
             cur = self.conn.execute(
-                "INSERT OR IGNORE INTO signals VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (r["acc"], r["ticker"], r.get("company", ""), r.get("insider", ""),
+                "INSERT OR IGNORE INTO signals (acc, ticker, company, insider, buy_date, price, value, score, "
+                "first_seen, pattern, cluster, side) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (key, r["ticker"], r.get("company", ""), r.get("insider", ""),
                  r.get("trade_start") or r.get("filing_date"), r.get("price"), r.get("value"),
-                 r["score"], today, r.get("pattern", ""), r.get("cluster", 1)))
+                 r["score"], today, r.get("pattern", ""), r.get("cluster", 1), r["code"]))
             n += cur.rowcount
         self.conn.commit()
         return n
@@ -1092,18 +1250,23 @@ def score_band(score: int | None) -> str:
     return "70+" if score >= 70 else ("50-69" if score >= 50 else "under 50")
 
 
-def track_record_summary(items: list) -> dict:
-    """items: dicts with score, ret, excess -> per score band: count, avg return, avg vs SPY, % beating SPY."""
+def track_record_summary(items: list, side: str = "P") -> dict:
+    """items: dicts with score, ret, excess -> per score band: count, avg return, avg vs SPY, % beating SPY.
+
+    For sales (side "S") a good warning is one where the stock then lagged SPY, so 'beat' is the % that lagged.
+    """
     out = {}
+    items = [x for x in items if (x.get("side") or "P") == side]
     for band in ("70+", "50-69", "under 50"):
         sel = [x for x in items if score_band(x.get("score")) == band and x.get("ret") is not None]
         if not sel:
             out[band] = None
             continue
         ex = [x["excess"] for x in sel if x.get("excess") is not None]
+        good = (lambda e: e > 0) if side == "P" else (lambda e: e < 0)
         out[band] = {"n": len(sel), "avg": sum(x["ret"] for x in sel) / len(sel),
                      "avg_excess": (sum(ex) / len(ex)) if ex else None,
-                     "beat": (sum(1 for e in ex if e > 0) / len(ex) * 100) if ex else None}
+                     "beat": (sum(1 for e in ex if good(e)) / len(ex) * 100) if ex else None}
     return out
 
 
@@ -1230,6 +1393,15 @@ def evaluate_record(record: dict, cand: dict, params: ScanParams) -> list[dict]:
             dates = sorted({x.get("date", "") for x in chunk if x.get("date")})
             plan = bool(record.get("plan10b5")) or any(x.get("plan") for x in chunk)
             offering = bool(record.get("offering_doc")) or any(x.get("offer") for x in chunk)
+            stake = stake_change_pct(chunk)
+            explained = any(x.get("explained") for x in chunk)
+            exercise_sell = code == "S" and any(
+                t.get("code") == "M" and t.get("date") in dates for t in record.get("txns", []))
+            # deep check: every buy; sales only when they look significant (saves requests)
+            deep = bool(params.check_history and (
+                code == "P" or (code == "S" and not plan and not offering
+                                and ((stake is not None and stake <= -10) or value >= 1_000_000))))
+            pend = "\u2026" if deep else ""
             rows.append({
                 "filing_date": record.get("filing_date") or cand.get("date", ""),
                 "ticker": record.get("ticker") or cand.get("ticker", "") or "",
@@ -1248,7 +1420,7 @@ def evaluate_record(record: dict, cand: dict, params: ScanParams) -> list[dict]:
                 "lots": len(chunk),
                 "form": record.get("form", ""),
                 "acc": record["acc"],
-                "stake": stake_change_pct(chunk),
+                "stake": stake,
                 "plan": plan,
                 "cluster_key": cluster_key(record, code),
                 "cluster": 1,
@@ -1257,17 +1429,20 @@ def evaluate_record(record: dict, cand: dict, params: ScanParams) -> list[dict]:
                 "issuer_cik": record.get("issuer_cik", "") or cand.get("issuer_cik") or "",
                 "trade_start": dates[0] if dates else (record.get("filing_date") or ""),
                 "held_after": holdings_after(chunk),
-                "pattern": "\u2026" if (code == "P" and params.check_history) else "",
-                "pattern_kind": "pending" if (code == "P" and params.check_history) else "na",
-                "sold": "\u2026" if (code == "P" and params.check_history) else "",
-                "sold_kind": "pending" if (code == "P" and params.check_history) else "na",
+                "pattern": pend,
+                "pattern_kind": "pending" if deep else "na",
+                "sold": pend if code == "P" else "",
+                "sold_kind": "pending" if (deep and code == "P") else "na",
                 "sold_pct": None,
                 "offering": offering,
                 "entity": is_entity(record["owners"][0].get("name", "")),
                 "roles_all": sorted(all_roles),
-                "deep": bool(code == "P" and params.check_history),
+                "deep": deep,
                 "late_days": late_business_days(dates[0] if dates else "", record.get("filing_date") or ""),
                 "dup_of": "",
+                "explained": explained,
+                "exercise_sell": exercise_sell,
+                "hkey": record["acc"] if code == "P" else f"{record['acc']}|{code}",
             })
     return rows
 
@@ -1459,12 +1634,13 @@ class Scanner:
     def _emit(self, rows: list) -> None:
         self.post("rows", rows)
         for r in rows:
-            if r["code"] != "P":
+            if not (r["code"] == "P" or (r["code"] == "S" and r.get("deep"))):
                 continue
-            b = self.buys.get(r["acc"])
+            b = self.buys.get(r["hkey"])            # buys and significant sales, keyed by hkey
             if b is None:
-                self.buys[r["acc"]] = {k: r[k] for k in ("owner_cik", "issuer_cik", "trade_start", "ticker",
-                                                          "filing_date", "held_after", "value", "shares", "price")}
+                self.buys[r["hkey"]] = {k: r[k] for k in ("owner_cik", "issuer_cik", "trade_start", "ticker", "acc",
+                                                           "code", "filing_date", "held_after", "value", "shares",
+                                                           "price")}
             else:
                 b["trade_start"] = min(b["trade_start"], r["trade_start"])
                 b["value"] += r["value"]
@@ -1511,8 +1687,13 @@ class Scanner:
     def _classify(self, acc: str, buy: dict, accs: set | None, cache: Cache, owner: str, issuer: str) -> dict:
         trade = _to_date(buy["trade_start"]) or _to_date(buy["filing_date"])
         buy["prior_buys"] = []
+        code = buy.get("code", "P")
+        acc = buy.get("acc", acc)
         if accs is None or trade is None:
-            return self._unknown()
+            out = self._unknown()
+            if code != "P":
+                out.update({"sold": "", "sold_kind": "na"})
+            return out
         prior, records = [], []
         for a in accs:
             rec = cache.get_filing(a)
@@ -1526,29 +1707,32 @@ class Scanner:
             if a == acc:
                 continue
             for t in rec.get("txns", []):
-                if t.get("t") == "N" and t.get("code") == "P":
+                if t.get("t") == "N" and t.get("code") == code:
                     d = _to_date(t.get("date", ""))
                     if d and d < trade:
                         prior.append(d)
-                        if not (rec.get("offering_doc") or t.get("offer")):
+                        if code == "P" and not (rec.get("offering_doc") or t.get("offer")):
                             buy["prior_buys"].append((d.isoformat(), t.get("sh"), t.get("px")))
         p_kind, p_label = classify_pattern(trade, prior)
+        if code != "P":
+            return {"pattern": p_label.replace("First buy", "First sale"), "pattern_kind": p_kind,
+                    "sold": "", "sold_kind": "na", "sold_pct": None}
         s_kind, s_label, s_pct = classify_later_sales(trade, records, buy.get("held_after"))
         return {"pattern": p_label, "pattern_kind": p_kind, "sold": s_label, "sold_kind": s_kind, "sold_pct": s_pct}
 
     def history_phase(self, client: SecClient, cache: Cache) -> None:
         since = (_years_ago(dt.date.today(), HISTORY_YEARS) - dt.timedelta(days=120)).isoformat()
         pairs: dict[tuple, list] = {}
-        for acc, b in self.buys.items():
+        for hk, b in self.buys.items():
             if b["owner_cik"] and b["issuer_cik"]:
-                pairs.setdefault((b["owner_cik"], str(b["issuer_cik"])), []).append(acc)
+                pairs.setdefault((b["owner_cik"], str(b["issuer_cik"])), []).append(hk)
             else:
-                self.post("history", {acc: self._unknown()})
+                self.post("history", {hk: self._unknown()})
         order = sorted(pairs, key=lambda k: -max(self.buys[a]["value"] for a in pairs[k]))
         total, done = len(order), 0
         if not total:
             return
-        self.post("phase", f"Checking buying history & later sales for {total:,} insiders...")
+        self.post("phase", f"Checking trading history for {total:,} insiders (buy pattern, later sales, seller pattern)...")
         self.post("history_progress", (0, total))
         lists = self._lists
         ex = ThreadPoolExecutor(max_workers=FETCH_WORKERS)
@@ -1568,7 +1752,7 @@ class Scanner:
                         pair_accs[pair] = None
                         continue
                     o_f4, i_f4 = o_list["f4"], i_list["f4"]
-                    accs = (set(o_f4) & set(i_f4)) | set(pairs[pair])
+                    accs = (set(o_f4) & set(i_f4)) | {self.buys[h]["acc"] for h in pairs[pair]}
                     pair_accs[pair] = accs
                     for a in accs:
                         if a not in todo and cache.get_filing(a) is None:
@@ -1741,7 +1925,7 @@ class Scanner:
                         em = earnings_metrics(sb, (lst or {}).get("earn", []), bdate)
                         results[acc] = {
                             "shares_out": so,
-                            "pct_co": (b["shares"] / so * 100.0) if so else None,
+                            "pct_co": ((b["shares"] / so * 100.0) if so else None) if b.get("code", "P") == "P" else None,
                             "mcap": mcap,
                             "off_high": pm.get("off_high"), "chg3m": pm.get("chg3m"),
                             "since": pm.get("since_buy"), "last_close": pm.get("last_close"),
@@ -1751,7 +1935,8 @@ class Scanner:
                             "earn_move": em.get("earn_move"),
                             "equity": equity, "cash": cash, "ocf": ocf,
                             **health_flags(equity, cash, ocf, mcap),
-                            "ins_rec": insider_record(b.get("prior_buys") or [], sb, spy or [], today),
+                            "ins_rec": insider_record(b.get("prior_buys") or [], sb, spy or [], today)
+                            if b.get("code", "P") == "P" else None,
                             "prices_ok": bool(pm),
                         }
                     done += 1
@@ -1929,6 +2114,7 @@ class Scanner:
             self.flush_clusters(force=True)
             for acc in self.dups:                       # don't spend requests on duplicates
                 self.buys.pop(acc, None)
+                self.buys.pop(f"{acc}|S", None)
             if self.p.check_history and self.buys:
                 self.history_phase(client, cache)
                 self.context_phase(client, cache)
@@ -2110,6 +2296,7 @@ def parse_bulk_zip(data: bytes) -> dict:
         })
     plan_fn: dict[str, set] = {}
     offer_fn: dict[str, set] = {}
+    expl_fn: dict[str, set] = {}
     for r in rows("FOOTNOTES"):
         acc = (r.get("ACCESSION_NUMBER") or "").strip()
         if acc not in recs:
@@ -2120,11 +2307,13 @@ def parse_bulk_zip(data: bytes) -> dict:
             plan_fn.setdefault(acc, set()).add(fid)
         if OFFERING_RE.search(text):
             offer_fn.setdefault(acc, set()).add(fid)
+        if EXPLAINED_RE.search(text):
+            expl_fn.setdefault(acc, set()).add(fid)
     for r in rows("NONDERIV_TRANS"):
         acc = (r.get("ACCESSION_NUMBER") or "").strip()
         rec = recs.get(acc)
         code = (r.get("TRANS_CODE") or "").strip().upper()
-        if rec is None or code not in ("P", "S"):
+        if rec is None or code not in ("P", "S", "M"):
             continue
         fns = set()
         for k, v in r.items():
@@ -2143,10 +2332,11 @@ def parse_bulk_zip(data: bytes) -> dict:
             "own": (r.get("DIRECT_INDIRECT_OWNERSHIP") or "D").strip().upper() or "D",
             "nat": (r.get("NATURE_OF_OWNERSHIP") or "").strip(),
             "plan": bool(fns & plan_fn.get(acc, set())), "offer": bool(fns & offer_fn.get(acc, set())),
+            "explained": bool(fns & expl_fn.get(acc, set())),
         })
     out = {}
     for acc, rec in recs.items():
-        if rec["txns"] and rec["owners"] and rec["filing_date"]:
+        if any(t["code"] in ("P", "S") for t in rec["txns"]) and rec["owners"] and rec["filing_date"]:
             rec["txns"].sort(key=lambda t: t.pop("sk", 0))
             out[acc] = rec
     return out
@@ -2179,6 +2369,7 @@ class BacktestParams:
     min_value: float = 100_000.0
     max_signals: int = 2000
     company_data: bool = True
+    side: str = "P"                        # "P" = test the buy Signal Score, "S" = the Sell Score
 
 
 def _mean(xs: list) -> float | None:
@@ -2186,7 +2377,7 @@ def _mean(xs: list) -> float | None:
     return (sum(xs) / len(xs)) if xs else None
 
 
-def band_stats(rows: list, score_key: str = "score") -> dict:
+def band_stats(rows: list, score_key: str = "score", side: str = "P") -> dict:
     out = {}
     for band in ("70+", "50-69", "under 50", "All"):
         sel = rows if band == "All" else [r for r in rows if score_band(r.get(score_key)) == band]
@@ -2196,16 +2387,22 @@ def band_stats(rows: list, score_key: str = "score") -> dict:
             st[f"ex{h}"] = _mean([r.get(f"ex{h}") for r in sel])
         ex6 = [r["ex6M"] for r in sel if r.get("ex6M") is not None]
         st["n6"] = len(ex6)
-        st["hit6"] = (sum(1 for x in ex6 if x > 0) / len(ex6) * 100.0) if ex6 else None
+        good = (lambda x: x > 0) if side == "P" else (lambda x: x < 0)
+        st["hit6"] = (sum(1 for x in ex6 if good(x)) / len(ex6) * 100.0) if ex6 else None
         out[band] = st
     return out
 
 
-def factor_stats(rows: list, min_n: int = 30) -> list[dict]:
-    """One-factor comparison of 6-month excess return with vs without each factor."""
+def factor_stats(rows: list, min_n: int = 30, side: str = "P") -> list[dict]:
+    """One-factor comparison of 6-month excess return with vs without each factor.
+
+    Buys: points follow the difference. Sales: a higher Sell Score should mean a WORSE return,
+    so points follow minus the difference.
+    """
     priced = [r for r in rows if r.get("ex6M") is not None]
     out = []
-    for key, (default, label) in FACTORS.items():
+    sign = 1 if side == "P" else -1
+    for key, (default, label) in (FACTORS if side == "P" else SELL_FACTORS).items():
         w = [r["ex6M"] for r in priced if key in r.get("factors", ())]
         wo = [r["ex6M"] for r in priced if key not in r.get("factors", ())]
         if not w:
@@ -2213,7 +2410,7 @@ def factor_stats(rows: list, min_n: int = 30) -> list[dict]:
         a, b = _mean(w), _mean(wo)
         uplift = (a - b) if (a is not None and b is not None) else None
         ok = len(w) >= min_n and len(wo) >= min_n and uplift is not None
-        sugg = max(-25, min(25, int(round(uplift)))) if ok else WEIGHTS.get(key, default)
+        sugg = max(-25, min(25, int(round(sign * uplift)))) if ok else WEIGHTS.get(key, default)
         out.append({"key": key, "label": label, "current": WEIGHTS.get(key, default), "n_with": len(w),
                     "n_without": len(wo), "with": a, "without": b, "uplift": uplift, "suggested": sugg,
                     "enough": ok})
@@ -2308,6 +2505,8 @@ class Backtester:
         self.post("phase", f"Indexing {len(records):,} Form 4 filings...")
         by_issuer: dict[str, list] = {}
         buys_by_pair: dict[tuple, list] = {}
+        sells_by_pair: dict[tuple, list] = {}
+        side = p.side if p.side in ("P", "S") else "P"
         sigs: dict[tuple, tuple] = {}
         dups: set = set()
         for rec in sorted(records.values(), key=lambda r: (r["filing_date"], r["acc"])):
@@ -2333,9 +2532,11 @@ class Backtester:
                     (t["date"], rec["filing_date"], who, t["code"], t.get("sh") or 0.0, t.get("px") or 0.0, disc))
                 if t["code"] == "P" and not (t.get("offer") or rec.get("offering_doc")):
                     buys_by_pair.setdefault((who, iss), []).append((t["date"], rec["filing_date"], t.get("sh"), t.get("px")))
+                elif t["code"] == "S":
+                    sells_by_pair.setdefault((who, iss), []).append((t["date"], rec["filing_date"], t.get("sh"), t.get("px")))
 
         # 3) candidate signals in the evaluation period
-        sp = ScanParams(start=eval_start, end=eval_end, user_agent=p.user_agent, codes={"P"},
+        sp = ScanParams(start=eval_start, end=eval_end, user_agent=p.user_agent, codes={side},
                         min_value=p.min_value, combine_lots=True, check_history=False)
         cands = []
         for rec in records.values():
@@ -2439,11 +2640,12 @@ class Backtester:
             fiso = r["filing_date"]
             # cluster: different discretionary buyers in the 30 days to this trade, already reported
             lo = (tdate - dt.timedelta(days=30)).isoformat()
-            win = [h for h in hist if h[3] == "P" and h[6] and lo <= h[0] <= fiso and h[1] <= fiso]
+            win = [h for h in hist if h[3] == side and h[6] and lo <= h[0] <= fiso and h[1] <= fiso]
             r["cluster"] = max(1, len({h[2] for h in win} | ({who} if not (r.get("plan") or r.get("offering")) else set())))
             cl_sh = sum(h[4] for h in win)
             # pattern from earlier buys by the same insider
-            prior = [_to_date(b[0]) for b in buys_by_pair.get((who, iss), []) if b[1] <= fiso and b[0] < tdate.isoformat()]
+            same = buys_by_pair if side == "P" else sells_by_pair
+            prior = [_to_date(b[0]) for b in same.get((who, iss), []) if b[1] <= fiso and b[0] < tdate.isoformat()]
             r["pattern_kind"], r["pattern"] = classify_pattern(tdate, [d for d in prior if d])
             # net insider flow, 90 days to the filing
             lo90 = (fdate - dt.timedelta(days=90)).isoformat()
@@ -2461,7 +2663,7 @@ class Backtester:
             close_f = pm.get("last_close")
             # insider's own record from buys at least 6 months before this filing
             pb = [(x[0], x[2], x[3]) for x in buys_by_pair.get((who, iss), []) if x[1] <= fiso and x[0] < tdate.isoformat()]
-            r["ins_rec"] = insider_record(pb, b, spy, fdate)
+            r["ins_rec"] = insider_record(pb, b, spy, fdate) if side == "P" else None
             # company data
             if p.company_data:
                 per_i, per_a = frame_period_instant(fdate), frame_period_annual(fdate)
@@ -2469,7 +2671,7 @@ class Backtester:
                 so = frames.get(f"shares:{per_i}", {}).get(cik)
                 r["shares_out"] = so
                 r["mcap"] = (so * close_f) if (so and close_f) else None
-                r["cluster_pct_co"] = (cl_sh / so * 100.0) if so else None
+                r["cluster_pct_co"] = (cl_sh / so * 100.0) if (so and side == "P") else None
                 eq = frames.get(f"equity:{per_i}", {}).get(cik)
                 cash = frames.get(f"cash:{per_i}", {}).get(cik)
                 ocf = frames.get(f"ocf:{per_a}", {}).get(cik)
@@ -2483,30 +2685,30 @@ class Backtester:
                 rv, mv = forward_return(b, fdate, days), forward_return(spy, fdate, days)
                 r[f"ret{h}"] = rv
                 r[f"ex{h}"] = (rv - mv) if (rv is not None and mv is not None) else None
-            r["factors"] = [k for k, _ in score_factors(r)]
-            r["score"], r["score_why"] = signal_score(r)
+            r["factors"] = [k for k, _ in (score_factors(r) if side == "P" else sell_factors(r))]
+            r["score"], r["score_why"] = rate_row(r)
             out.append(r)
 
         # 7) statistics, plus weights tuned on the first half and checked on the second
         priced = [r for r in out if r.get("ex6M") is not None]
         half = len(priced) // 2
         train, test = priced[:half], priced[half:]
-        fs_all = factor_stats(out)
-        fs_train = factor_stats(train)
+        fs_all = factor_stats(out, side=side)
+        fs_train = factor_stats(train, side=side)
         suggested = {f["key"]: f["suggested"] for f in fs_train if f["enough"]}
         tuned_w = dict(WEIGHTS)
         tuned_w.update(suggested)
         for r in test:
-            r["score_tuned"], _ = signal_score(r, tuned_w)
+            r["score_tuned"], _ = rate_row(r, tuned_w)
         res = {
             "params": {"start": p.start_q.upper(), "end": p.end_q.upper(), "warmup": p.warmup_quarters,
-                       "min_value": p.min_value, "max_signals": p.max_signals},
+                       "min_value": p.min_value, "max_signals": p.max_signals, "side": side},
             "filings": len(records), "candidates": total_cands, "signals": len(out),
             "priced": sum(1 for r in out if r.get("ret1M") is not None), "priced6": len(priced),
             "dups": len(dups), "missing_quarters": missing,
-            "bands": band_stats(out), "factors": fs_all, "suggested": suggested,
+            "bands": band_stats(out, side=side), "factors": fs_all, "suggested": suggested,
             "split_date": priced[half]["filing_date"] if priced and half < len(priced) else "",
-            "test_current": band_stats(test, "score"), "test_tuned": band_stats(test, "score_tuned"),
+            "test_current": band_stats(test, "score", side), "test_tuned": band_stats(test, "score_tuned", side),
             "rows": out,
         }
         self.post("bt_done", res)
@@ -2530,6 +2732,53 @@ def bt_row_csv(r: dict) -> list:
 # ============================================================================
 # GUI
 # ============================================================================
+THEMES = {
+    "Light": {
+        "bg": "#f3f5f8", "panel": "#ffffff", "fg": "#1f2933", "muted": "#6b7480", "border": "#d5dbe3",
+        "accent": "#2563eb", "accent_fg": "#ffffff", "accent_hover": "#1d4ed8", "header": "#1e3a5f",
+        "header_fg": "#ffffff", "header_btn": "#2b4c78", "header_btn_hover": "#355c90", "entry": "#ffffff",
+        "select": "#cfe0ff", "select_fg": "#0b1220", "tree": "#ffffff", "heading": "#e8edf4",
+        "buy_bg": "#e8f6ec", "buy_fg": "#14532d", "sell_bg": "#fbeaea", "sell_fg": "#7f1d1d",
+        "hot_bg": "#c4ecd1", "hot_fg": "#0b3d20", "hotsell_bg": "#f5c6c6", "hotsell_fg": "#6b0f0f",
+        "flip_bg": "#fdebd3", "flip_fg": "#8a4b08", "routine_bg": "#eeeeee", "routine_fg": "#5f6670",
+        "grant_bg": "#eef2fb", "exercise_bg": "#f6f1e7", "group_bg": "#dde5f0", "group_fg": "#102a43",
+        "card": "#ffffff", "good": "#15803d", "bad": "#b91c1c", "tip": "#ffffe1", "dark": False},
+    "Dark": {
+        "bg": "#15171c", "panel": "#1e2229", "fg": "#e5e7eb", "muted": "#9aa3af", "border": "#323844",
+        "accent": "#3b82f6", "accent_fg": "#ffffff", "accent_hover": "#2563eb", "header": "#0d0f13",
+        "header_fg": "#f3f4f6", "header_btn": "#23272f", "header_btn_hover": "#2e3440", "entry": "#272c35",
+        "select": "#2f4a73", "select_fg": "#ffffff", "tree": "#1a1d23", "heading": "#252a33",
+        "buy_bg": "#16301f", "buy_fg": "#a7f3c0", "sell_bg": "#371b1e", "sell_fg": "#fca5a5",
+        "hot_bg": "#1d4a31", "hot_fg": "#d1fae5", "hotsell_bg": "#5a1d23", "hotsell_fg": "#ffe1e1",
+        "flip_bg": "#45301a", "flip_fg": "#fcd9a8", "routine_bg": "#22252b", "routine_fg": "#878f9c",
+        "grant_bg": "#1c2638", "exercise_bg": "#332e20", "group_bg": "#2a313d", "group_fg": "#f3f4f6",
+        "card": "#21262e", "good": "#4ade80", "bad": "#f87171", "tip": "#2a2f39", "dark": True},
+    "Midnight Blue": {
+        "bg": "#1a2232", "panel": "#212b3d", "fg": "#dbe4f0", "muted": "#93a3ba", "border": "#34425c",
+        "accent": "#5b9cf6", "accent_fg": "#0d1726", "accent_hover": "#7ab0f8", "header": "#121a28",
+        "header_fg": "#e6eefb", "header_btn": "#24314a", "header_btn_hover": "#2e3e5d", "entry": "#28344b",
+        "select": "#34507d", "select_fg": "#ffffff", "tree": "#1e2738", "heading": "#29354d",
+        "buy_bg": "#1c3a35", "buy_fg": "#b5f0d3", "sell_bg": "#3b2433", "sell_fg": "#f5b3c4",
+        "hot_bg": "#21523f", "hot_fg": "#dcfce7", "hotsell_bg": "#5a2638", "hotsell_fg": "#ffe4ec",
+        "flip_bg": "#4a3a22", "flip_fg": "#fde2b8", "routine_bg": "#253043", "routine_fg": "#8797ae",
+        "grant_bg": "#22304a", "exercise_bg": "#373424", "group_bg": "#2d3a55", "group_fg": "#f1f5fb",
+        "card": "#24304a", "good": "#6ee7a8", "bad": "#fb8a9a", "tip": "#2a3650", "dark": True},
+    "Sepia (warm)": {
+        "bg": "#f2eadb", "panel": "#fbf6ec", "fg": "#3b2f24", "muted": "#7a6a58", "border": "#d9cbb3",
+        "accent": "#9a5b2e", "accent_fg": "#fffaf1", "accent_hover": "#82491f", "header": "#5a3e2b",
+        "header_fg": "#fdf6ea", "header_btn": "#6d4c36", "header_btn_hover": "#7d5a41", "entry": "#fffaf1",
+        "select": "#e8d5b5", "select_fg": "#2b2018", "tree": "#fbf6ec", "heading": "#eee2cd",
+        "buy_bg": "#e3efd9", "buy_fg": "#2f5320", "sell_bg": "#f3dcd5", "sell_fg": "#7a2a1b",
+        "hot_bg": "#cfe5bf", "hot_fg": "#22401a", "hotsell_bg": "#ebc3b6", "hotsell_fg": "#5e1d10",
+        "flip_bg": "#f2dcc0", "flip_fg": "#7a4a14", "routine_bg": "#ece4d6", "routine_fg": "#857865",
+        "grant_bg": "#ebe6dc", "exercise_bg": "#efe5cf", "group_bg": "#e6d9c2", "group_fg": "#2f241a",
+        "card": "#fffaf1", "good": "#4d7c2f", "bad": "#a3361f", "tip": "#fffaf1", "dark": False},
+}
+VIEWS = [("all", "All trades"), ("top_buys", "Top buys"), ("top_sells", "Top sells"),
+         ("clusters", "Cluster buys"), ("company", "By company"), ("insider", "By insider"),
+         ("largest", "Largest $")]
+
+
 def resource_path(name: str) -> str:
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, name)
@@ -2580,6 +2829,7 @@ def run_gui() -> None:
         ("link", "SEC Link", 260, "w", False),
     ]
     HEADINGS = {c[0]: c[1] for c in COLUMNS}
+    COL_KEYS = [c[0] for c in COLUMNS]
     TOOLTIPS = {
         "stake": "How much this trade grew (or shrank) the insider's holding. 'New' = first shares.",
         "cluster": "Number of different insiders making the same kind of trade in this company during the scanned dates. "
@@ -2652,22 +2902,26 @@ def run_gui() -> None:
                         root.iconphoto(True, self._icon_img)
             except Exception:
                 pass
-            self._style()
+            self._groups: list[str] = []
+            self._user_sorted = False
+            self._init_style()
             self._menu()
+            self._header()
             self._controls()
+            self._cards()
+            self._viewbar()
             self._table()
             self._footer()
+            self.apply_theme(self.theme_name)
             self._on_range_change()
             root.protocol("WM_DELETE_WINDOW", self.on_close)
             root.after(100, self._poll)
 
         # ---- look & feel ------------------------------------------------
-        def _style(self):
+        def _init_style(self):
             s = ttk.Style(self.root)
-            for theme in ("vista", "clam"):
-                if theme in s.theme_names():
-                    s.theme_use(theme)
-                    break
+            s.theme_use("clam")                       # fully recolourable on every platform
+            self.style = s
             base = ("Segoe UI", 10) if sys.platform == "win32" else ("DejaVu Sans", 10)
             self.base_font = base
             for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
@@ -2676,23 +2930,165 @@ def run_gui() -> None:
                 except tk.TclError:
                     pass
             linespace = tkfont.Font(family=base[0], size=base[1]).metrics("linespace")
-            s.configure(".", font=base)
-            s.configure("Treeview", font=base, rowheight=max(24, int(linespace * 1.55)))
-            s.configure("Treeview.Heading", font=(base[0], base[1], "bold"))
-            s.configure("Title.TLabel", font=(base[0], 15, "bold"))
-            s.configure("Sub.TLabel", foreground="#5b6470")
-            s.configure("Hint.TLabel", foreground="#6b7480", font=(base[0], 9))
-            s.configure("Big.TButton", font=(base[0], 10, "bold"), padding=(14, 6))
-            s.configure("TLabelframe.Label", font=(base[0], 10, "bold"))
+            self.row_height = max(24, int(linespace * 1.6))
             self.bold_font = tkfont.Font(family=base[0], size=base[1], weight="bold")
+            self.title_font = tkfont.Font(family=base[0], size=17, weight="bold")
+            self.card_value_font = tkfont.Font(family=base[0], size=16, weight="bold")
+            self.card_label_font = tkfont.Font(family=base[0], size=9)
+            self._theme_listeners: list = []
+            self._menus: list = []
+            name = self.settings.get("theme", "Light")
+            self.theme_name = name if name in THEMES else "Light"
+            self.T = THEMES[self.theme_name]
 
-            def fixed_map(option):   # Tk 8.6.9 Treeview tag-colour bug
-                return [e for e in s.map("Treeview", query_opt=option) if e[:2] != ("!disabled", "!selected")]
-            s.map("Treeview", foreground=fixed_map("foreground"), background=fixed_map("background"))
+        def apply_theme(self, name: str):
+            if name not in THEMES:
+                name = "Light"
+            self.theme_name, T, s, base = name, THEMES[name], self.style, self.base_font
+            self.T = T
+            if hasattr(self, "theme_var"):
+                self.theme_var.set(name)
+            s.configure(".", background=T["bg"], foreground=T["fg"], fieldbackground=T["entry"],
+                        bordercolor=T["border"], lightcolor=T["bg"], darkcolor=T["bg"], troughcolor=T["border"],
+                        selectbackground=T["select"], selectforeground=T["select_fg"], insertcolor=T["fg"],
+                        focuscolor=T["accent"], font=base)
+            s.map(".", foreground=[("disabled", T["muted"])])
+            s.configure("TFrame", background=T["bg"])
+            s.configure("TLabel", background=T["bg"], foreground=T["fg"])
+            s.configure("Title.TLabel", background=T["bg"], foreground=T["fg"], font=(base[0], 15, "bold"))
+            s.configure("Sub.TLabel", background=T["bg"], foreground=T["muted"])
+            s.configure("Hint.TLabel", background=T["bg"], foreground=T["muted"], font=(base[0], 9))
+            s.configure("TLabelframe", background=T["bg"], bordercolor=T["border"], lightcolor=T["bg"], darkcolor=T["bg"])
+            s.configure("TLabelframe.Label", background=T["bg"], foreground=T["accent"], font=(base[0], 10, "bold"))
+            s.configure("TButton", background=T["panel"], foreground=T["fg"], bordercolor=T["border"],
+                        lightcolor=T["panel"], darkcolor=T["panel"], padding=(10, 4))
+            s.map("TButton", background=[("disabled", T["bg"]), ("pressed", T["select"]), ("active", T["heading"])],
+                  foreground=[("disabled", T["muted"])])
+            s.configure("Big.TButton", font=(base[0], 10, "bold"), padding=(14, 6))
+            s.configure("Accent.TButton", background=T["accent"], foreground=T["accent_fg"], bordercolor=T["accent"],
+                        lightcolor=T["accent"], darkcolor=T["accent"], font=(base[0], 10, "bold"), padding=(16, 6))
+            s.map("Accent.TButton", background=[("disabled", T["border"]), ("pressed", T["accent_hover"]),
+                                                ("active", T["accent_hover"])],
+                  foreground=[("disabled", T["muted"])])
+            for st_ in ("Header.TButton", "Header.TMenubutton"):
+                s.configure(st_, background=T["header_btn"], foreground=T["header_fg"], bordercolor=T["header_btn"],
+                            lightcolor=T["header_btn"], darkcolor=T["header_btn"], arrowcolor=T["header_fg"],
+                            padding=(12, 5), font=(base[0], 10, "bold"))
+                s.map(st_, background=[("pressed", T["header_btn_hover"]), ("active", T["header_btn_hover"])])
+            s.configure("HeaderAccent.TButton", background=T["accent"], foreground=T["accent_fg"], bordercolor=T["accent"],
+                        lightcolor=T["accent"], darkcolor=T["accent"], padding=(12, 5), font=(base[0], 10, "bold"))
+            s.map("HeaderAccent.TButton", background=[("pressed", T["accent_hover"]), ("active", T["accent_hover"])])
+            for st_ in ("TCheckbutton", "TRadiobutton"):
+                s.configure(st_, background=T["bg"], foreground=T["fg"], indicatorbackground=T["entry"],
+                            indicatorforeground=T["accent"], upperbordercolor=T["border"], lowerbordercolor=T["border"])
+                s.map(st_, background=[("active", T["bg"])],
+                      indicatorbackground=[("pressed", T["select"]), ("selected", T["entry"])])
+            s.configure("Seg.Toolbutton", background=T["panel"], foreground=T["fg"], bordercolor=T["border"],
+                        lightcolor=T["panel"], darkcolor=T["panel"], padding=(12, 4), anchor="center")
+            s.map("Seg.Toolbutton", background=[("selected", T["accent"]), ("active", T["heading"])],
+                  foreground=[("selected", T["accent_fg"])])
+            for st_ in ("TEntry", "TCombobox", "TSpinbox"):
+                s.configure(st_, fieldbackground=T["entry"], foreground=T["fg"], background=T["panel"],
+                            bordercolor=T["border"], lightcolor=T["entry"], darkcolor=T["entry"], arrowcolor=T["fg"],
+                            insertcolor=T["fg"])
+                s.map(st_, fieldbackground=[("readonly", T["entry"]), ("disabled", T["bg"])],
+                      foreground=[("disabled", T["muted"])], bordercolor=[("focus", T["accent"])])
+            s.configure("TProgressbar", background=T["accent"], troughcolor=T["border"], bordercolor=T["border"],
+                        lightcolor=T["accent"], darkcolor=T["accent"])
+            s.configure("Treeview", background=T["tree"], fieldbackground=T["tree"], foreground=T["fg"],
+                        bordercolor=T["border"], lightcolor=T["tree"], darkcolor=T["tree"], font=base,
+                        rowheight=self.row_height)
+            s.map("Treeview", background=[("selected", T["select"])], foreground=[("selected", T["select_fg"])])
+            s.configure("Treeview.Heading", background=T["heading"], foreground=T["fg"], bordercolor=T["border"],
+                        lightcolor=T["heading"], darkcolor=T["heading"], relief="flat", font=(base[0], base[1], "bold"))
+            s.map("Treeview.Heading", background=[("active", T["select"])])
+            s.configure("TNotebook", background=T["bg"], bordercolor=T["border"], lightcolor=T["bg"], darkcolor=T["bg"])
+            s.configure("TNotebook.Tab", background=T["panel"], foreground=T["fg"], padding=(12, 4),
+                        bordercolor=T["border"], lightcolor=T["panel"], darkcolor=T["panel"])
+            s.map("TNotebook.Tab", background=[("selected", T["accent"])], foreground=[("selected", T["accent_fg"])])
+            s.configure("TScrollbar", background=T["panel"], troughcolor=T["bg"], bordercolor=T["border"],
+                        arrowcolor=T["fg"], lightcolor=T["panel"], darkcolor=T["panel"])
+            s.map("TScrollbar", background=[("active", T["heading"])])
+            self.root.configure(bg=T["bg"])
+            for opt, key in (("background", "entry"), ("foreground", "fg"), ("selectBackground", "select"),
+                             ("selectForeground", "select_fg")):
+                self.root.option_add(f"*TCombobox*Listbox.{opt}", T[key])
+            for m in self._menus:
+                try:
+                    m.configure(bg=T["panel"], fg=T["fg"], activebackground=T["select"],
+                                activeforeground=T["select_fg"], selectcolor=T["accent"], relief="flat")
+                except tk.TclError:
+                    pass
+            self._theme_tree_tags(self.tree)
+            self.header.configure(bg=T["header"])
+            for w in self._header_labels:
+                if isinstance(w, tk.Label) and w.cget("text"):
+                    w.configure(bg=T["header"], fg=T["header_fg"])
+                else:
+                    w.configure(bg=T["header"])
+            self.sub_lbl.configure(fg="#c9d6e8" if not T["dark"] else "#9aa3af")
+            for card in self._cards_w.values():
+                card["frame"].configure(bg=T["card"], highlightbackground=T["border"])
+                card["value"].configure(bg=T["card"], fg=T[card["color"]] if card["color"] else T["fg"])
+                card["label"].configure(bg=T["card"], fg=T["muted"])
+                card["detail"].configure(bg=T["card"], fg=T["muted"])
+            self.dark_titlebar(self.root, T["dark"])
+            for fn in list(self._theme_listeners):
+                try:
+                    fn(T)
+                except tk.TclError:
+                    self._theme_listeners.remove(fn)
+            if hasattr(self, "rows"):
+                self._update_summary()
+
+        def _theme_tree_tags(self, tree):
+            T = self.T
+            tree.tag_configure("Buy", background=T["buy_bg"], foreground=T["buy_fg"])
+            tree.tag_configure("Sell", background=T["sell_bg"], foreground=T["sell_fg"])
+            tree.tag_configure("Grant", background=T["grant_bg"], foreground=T["fg"])
+            tree.tag_configure("Exercise", background=T["exercise_bg"], foreground=T["fg"])
+            tree.tag_configure("hot", background=T["hot_bg"], foreground=T["hot_fg"], font=self.bold_font)
+            tree.tag_configure("hotsell", background=T["hotsell_bg"], foreground=T["hotsell_fg"], font=self.bold_font)
+            tree.tag_configure("flip", background=T["flip_bg"], foreground=T["flip_fg"])
+            tree.tag_configure("routine", background=T["routine_bg"], foreground=T["routine_fg"])
+            tree.tag_configure("group", background=T["group_bg"], foreground=T["group_fg"], font=self.bold_font)
+            tree.tag_configure("good", foreground=T["good"])
+            tree.tag_configure("bad", foreground=T["bad"])
+            tree.tag_configure("dim", foreground=T["muted"])
+            tree.tag_configure("up", foreground=T["good"])
+            tree.tag_configure("down", foreground=T["bad"])
+
+        @staticmethod
+        def dark_titlebar(win, dark: bool):
+            """Dark Windows title bar for dark themes (Windows 10 1809+ / 11)."""
+            if sys.platform != "win32":
+                return
+            try:
+                import ctypes
+                win.update_idletasks()
+                hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+                val = ctypes.c_int(1 if dark else 0)
+                for attr in (20, 19):
+                    if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val),
+                                                                  ctypes.sizeof(val)) == 0:
+                        break
+            except Exception:
+                pass
+
+        def theme_window(self, win, trees=()):
+            """Apply the current theme to another window now and whenever the theme changes."""
+            def apply(T):
+                win.configure(bg=T["bg"])
+                self.dark_titlebar(win, T["dark"])
+                for t in trees:
+                    self._theme_tree_tags(t)
+            apply(self.T)
+            self._theme_listeners.append(apply)
 
         def _menu(self):
             m = tk.Menu(self.root)
             fm = tk.Menu(m, tearoff=0)
+            self._menus += [m, fm]
             fm.add_command(label="Export Results to CSV...", command=self.export_csv, accelerator="Ctrl+E")
             fm.add_separator()
             fm.add_command(label="Signal Track Record...", command=self.show_track_record, accelerator="Ctrl+T")
@@ -2703,7 +3099,25 @@ def run_gui() -> None:
             fm.add_separator()
             fm.add_command(label="Exit", command=self.on_close)
             m.add_cascade(label="File", menu=fm)
+            pm = tk.Menu(m, tearoff=0)
+            pm.add_command(label="★  True Insider Buying", command=self.apply_preset)
+            pm.add_command(label="▼  Significant Insider Selling", command=self.apply_sell_preset)
+            m.add_cascade(label="Presets", menu=pm)
+            vm = tk.Menu(m, tearoff=0)
+            self.view_var = tk.StringVar(value=self.settings.get("view", "all"))
+            for key, label in VIEWS:
+                vm.add_radiobutton(label=label, value=key, variable=self.view_var, command=self._view_mode_changed)
+            vm.add_separator()
+            self.theme_var = tk.StringVar(value=self.theme_name)
+            tm = tk.Menu(vm, tearoff=0)
+            for name in THEMES:
+                tm.add_radiobutton(label=name, value=name, variable=self.theme_var,
+                                   command=lambda n=name: self.set_theme(n))
+            vm.add_cascade(label="Theme", menu=tm)
+            vm.add_command(label="Show / hide scan settings", command=self.toggle_settings, accelerator="Ctrl+H")
+            m.add_cascade(label="View", menu=vm)
             hm = tk.Menu(m, tearoff=0)
+            self._menus += [pm, vm, tm, hm]
             hm.add_command(label="How it works", command=self.show_help)
             hm.add_command(label="Finding true insider buying", command=self.show_signal_help)
             hm.add_command(label="SEC EDGAR Form 4 search", command=lambda: webbrowser.open(
@@ -2713,20 +3127,58 @@ def run_gui() -> None:
             self.root.bind_all("<Control-e>", lambda e: self.export_csv())
             self.root.bind_all("<Control-t>", lambda e: self.show_track_record())
             self.root.bind_all("<Control-b>", lambda e: self.show_backtest())
+            self.root.bind_all("<Control-h>", lambda e: self.toggle_settings())
+
+        def set_theme(self, name: str):
+            self.apply_theme(name)
+            self._save()
+
+        # ---- header bar ----------------------------------------------------
+        def _header(self):
+            T = self.T
+            self.header = tk.Frame(self.root, bg=T["header"], padx=16, pady=10)
+            self.header.pack(fill="x")
+            self._header_labels = []
+            try:
+                img = tk.PhotoImage(file=resource_path(os.path.join("assets", "app.png")))
+                self._hdr_icon = img.subsample(max(1, img.width() // 40))
+                lbl = tk.Label(self.header, image=self._hdr_icon, bg=T["header"], bd=0)
+                lbl.pack(side="left", padx=(0, 10))
+                self._header_labels.append(lbl)
+            except Exception:
+                pass
+            box = tk.Frame(self.header, bg=T["header"])
+            box.pack(side="left")
+            self._header_labels.append(box)
+            t = tk.Label(box, text="Form 4 Insider Scanner", font=self.title_font, bg=T["header"], fg=T["header_fg"])
+            t.pack(anchor="w")
+            self.sub_lbl = tk.Label(box, text="Insider buys & sells from SEC EDGAR, scored and organized",
+                                    font=(self.base_font[0], 9), bg=T["header"], fg="#c9d6e8")
+            self.sub_lbl.pack(anchor="w")
+            self._header_labels += [t, self.sub_lbl]
+            right = tk.Frame(self.header, bg=T["header"])
+            right.pack(side="right")
+            self._header_labels.append(right)
+            tm = tk.Menu(self.root, tearoff=0)
+            self._menus.append(tm)
+            for name in THEMES:
+                tm.add_radiobutton(label=name, value=name, variable=self.theme_var, command=lambda n=name: self.set_theme(n))
+            ttk.Menubutton(right, text="◐  Theme", style="Header.TMenubutton", menu=tm).pack(side="right", padx=(6, 0))
+            ttk.Button(right, text="Export CSV", style="Header.TButton", command=self.export_csv).pack(side="right", padx=(6, 0))
+            ttk.Button(right, text="Back-test", style="Header.TButton", command=self.show_backtest).pack(side="right", padx=(6, 0))
+            ttk.Button(right, text="Track Record", style="Header.TButton", command=self.show_track_record).pack(side="right", padx=(6, 0))
+            ttk.Button(right, text="▼  Insider Selling", style="Header.TButton", command=self.apply_sell_preset).pack(side="right", padx=(6, 0))
+            ttk.Button(right, text="★  Insider Buying", style="HeaderAccent.TButton", command=self.apply_preset).pack(side="right", padx=(6, 0))
 
         # ---- settings panel --------------------------------------------
         def _controls(self):
             st = self.settings
-            outer = ttk.Frame(self.root, padding=(14, 10, 14, 4))
+            outer = ttk.Frame(self.root, padding=(14, 6, 14, 2))
             outer.pack(fill="x")
-            head = ttk.Frame(outer)
-            head.pack(fill="x")
-            ttk.Label(head, text="SEC Form 4 Insider Trading Scanner", style="Title.TLabel").pack(side="left")
-            ttk.Label(head, text="   Insider buys & sells from SEC EDGAR", style="Sub.TLabel").pack(side="left", pady=(5, 0))
-            ttk.Button(head, text="★  True Insider Buying preset", command=self.apply_preset).pack(side="right")
-
-            grid = ttk.Frame(outer)
-            grid.pack(fill="x", pady=(8, 0))
+            self.settings_frame = ttk.Frame(outer)
+            self.settings_frame.pack(fill="x")
+            grid = ttk.Frame(self.settings_frame)
+            grid.pack(fill="x", pady=(2, 0))
             grid.columnconfigure(0, weight=1)
             grid.columnconfigure(1, weight=1)
 
@@ -2809,22 +3261,30 @@ def run_gui() -> None:
             e = ttk.Entry(f, textvariable=self.min_stake_var, width=6, validate="key", validatecommand=vcmd2)
             e.pack(side="left", padx=4)
             e.bind("<KeyRelease>", lambda ev: self._view_changed())
-            ttk.Label(f, text="%  (0 = off; buys only)").pack(side="left")
+            ttk.Label(f, text="% (buys)").pack(side="left", padx=(0, 22))
+            ttk.Label(f, text="Min % of holding sold").pack(side="left")
+            self.min_sold_var = tk.StringVar(value=str(st.get("min_sold", "0")))
+            e_s = ttk.Entry(f, textvariable=self.min_sold_var, width=5, validate="key", validatecommand=vcmd2)
+            e_s.pack(side="left", padx=4)
+            e_s.bind("<KeyRelease>", lambda ev: self._view_changed())
+            ttk.Label(f, text="% (sales)").pack(side="left", padx=(0, 22))
+            self.excl_explained_var = tk.BooleanVar(value=st.get("exclude_explained", False))
+            ttk.Checkbutton(f, text="Exclude explained / exercise-and-sell sales", variable=self.excl_explained_var,
+                            command=self._view_changed).pack(side="left")
             self.cluster_min_var.trace_add("write", lambda *a: self._view_changed())
 
             f2 = ttk.Frame(box)
             f2.pack(fill="x", pady=(4, 0))
             self.history_var = tk.BooleanVar(value=st.get("check_history", True))
-            ttk.Checkbutton(f2, text="Deep check buyers (history, later sales, company size, prices)",
+            ttk.Checkbutton(f2, text="Deep check (history, later sales, company size, prices)",
                             variable=self.history_var).pack(side="left", padx=(0, 22))
             self.hide_routine_var = tk.BooleanVar(value=st.get("hide_routine", False))
-            ttk.Checkbutton(f2, text="Hide routine / regular buyers", variable=self.hide_routine_var,
+            ttk.Checkbutton(f2, text="Hide routine / regular traders", variable=self.hide_routine_var,
                             command=self._view_changed).pack(side="left", padx=(0, 22))
             self.hide_sold_var = tk.BooleanVar(value=st.get("hide_sold", False))
             ttk.Checkbutton(f2, text="Hide buyers who have sold since", variable=self.hide_sold_var,
                             command=self._view_changed).pack(side="left", padx=(0, 22))
-            ttk.Label(f2, text="Deep check adds a few minutes the first time; results are cached.",
-                      style="Hint.TLabel").pack(side="left")
+
 
             f3 = ttk.Frame(box)
             f3.pack(fill="x", pady=(4, 0))
@@ -2862,7 +3322,7 @@ def run_gui() -> None:
                             command=self._view_changed).pack(side="left", padx=(22, 0))
 
             # SEC contact ---------------------------------------------------
-            f = ttk.Frame(outer)
+            f = ttk.Frame(self.settings_frame)
             f.pack(fill="x", pady=(6, 2))
             ttk.Label(f, text="SEC contact (User-Agent):").pack(side="left")
             self.ua_var = tk.StringVar(value=st.get("user_agent", ""))
@@ -2872,17 +3332,74 @@ def run_gui() -> None:
 
             # Action row -----------------------------------------------------
             f = ttk.Frame(outer)
-            f.pack(fill="x", pady=(8, 4))
-            self.start_btn = ttk.Button(f, text="▶  Start Scan", style="Big.TButton", command=self.start_scan)
+            f.pack(fill="x", pady=(8, 2))
+            self.action_row = f
+            self.start_btn = ttk.Button(f, text="▶  Start Scan", style="Accent.TButton", command=self.start_scan)
             self.start_btn.pack(side="left")
             self.cancel_btn = ttk.Button(f, text="■  Cancel", style="Big.TButton", command=self.cancel_scan, state="disabled")
             self.cancel_btn.pack(side="left", padx=(8, 0))
-            ttk.Button(f, text="Export CSV...", command=self.export_csv).pack(side="left", padx=(16, 0))
-            ttk.Button(f, text="Clear", command=self.clear_results).pack(side="left", padx=(6, 0))
+            ttk.Button(f, text="Clear", command=self.clear_results).pack(side="left", padx=(8, 0))
+            self.settings_btn = ttk.Button(f, text="⚙  Hide settings", command=self.toggle_settings)
+            self.settings_btn.pack(side="left", padx=(8, 0))
             self.progress = ttk.Progressbar(f, mode="determinate", length=300)
             self.progress.pack(side="left", padx=(20, 10))
             self.status_var = tk.StringVar(value="Ready.")
             ttk.Label(f, textvariable=self.status_var).pack(side="left", fill="x", expand=True)
+            if self.settings.get("settings_hidden"):
+                self.root.after(10, self.toggle_settings)
+
+        def toggle_settings(self):
+            if self.settings_frame.winfo_ismapped():
+                self.settings_frame.pack_forget()
+                self.settings_btn.config(text="⚙  Show settings")
+            else:
+                self.settings_frame.pack(fill="x", before=self.action_row)
+                self.settings_btn.config(text="⚙  Hide settings")
+
+        # ---- summary cards + view bar ------------------------------------------
+        def _cards(self):
+            T = self.T
+            wrap = ttk.Frame(self.root, padding=(14, 6, 14, 2))
+            wrap.pack(fill="x")
+            specs = [("shown", "Trades shown", None), ("buys", "Open-market buys", "good"),
+                     ("sells", "Open-market sales", "bad"), ("clusters", "Cluster-buy companies", None),
+                     ("best", "Best buy score", "good"), ("warn", "Strongest sell warning", "bad")]
+            self._cards_w = {}
+            for i, (key, label, color) in enumerate(specs):
+                fr = tk.Frame(wrap, bg=T["card"], highlightthickness=1, highlightbackground=T["border"],
+                              padx=14, pady=7)
+                fr.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 8, 0))
+                wrap.columnconfigure(i, weight=1, uniform="cards")
+                lb = tk.Label(fr, text=label.upper(), font=self.card_label_font, bg=T["card"], fg=T["muted"])
+                lb.pack(anchor="w")
+                val = tk.Label(fr, text="—", font=self.card_value_font, bg=T["card"], fg=T["fg"])
+                val.pack(anchor="w")
+                det = tk.Label(fr, text=" ", font=self.card_label_font, bg=T["card"], fg=T["muted"])
+                det.pack(anchor="w")
+                self._cards_w[key] = {"frame": fr, "value": val, "label": lb, "detail": det, "color": color}
+
+        def _viewbar(self):
+            f = ttk.Frame(self.root, padding=(14, 6, 14, 2))
+            f.pack(fill="x")
+            ttk.Label(f, text="View", style="Sub.TLabel").pack(side="left", padx=(0, 8))
+            for key, label in VIEWS:
+                ttk.Radiobutton(f, text=label, value=key, variable=self.view_var, style="Seg.Toolbutton",
+                                command=self._view_mode_changed).pack(side="left", padx=(0, 2))
+            ttk.Button(f, text="Collapse all", command=lambda: self._expand_all(False)).pack(side="right")
+            ttk.Button(f, text="Expand all", command=lambda: self._expand_all(True)).pack(side="right", padx=(0, 4))
+            self.search_var = tk.StringVar(value="")
+            e = ttk.Entry(f, textvariable=self.search_var, width=22)
+            e.pack(side="right", padx=(0, 14))
+            ttk.Label(f, text="Search", style="Sub.TLabel").pack(side="right", padx=(0, 6))
+            self.search_var.trace_add("write", lambda *a: self._schedule_view())
+
+        def _view_mode_changed(self):
+            self._user_sorted = False
+            self._apply_view()
+
+        def _expand_all(self, open_: bool):
+            for g in self._groups:
+                self.tree.item(g, open=open_)
 
         def _on_range_change(self):
             days = RANGE_CHOICES.get(self.range_var.get())
@@ -2899,6 +3416,37 @@ def run_gui() -> None:
                 self.to_var.set(today.isoformat())
                 self.from_entry.config(state="disabled")
                 self.to_entry.config(state="disabled")
+
+        def apply_sell_preset(self):
+            """Settings that isolate the kind of insider selling research links to weak returns."""
+            self.range_var.set("Last 30 Days")
+            self._on_range_change()
+            for v in self.role_vars.values():
+                v.set(False)
+            for c, v in self.code_vars.items():
+                v.set(c == "S")
+            self.min_var.set("250000")
+            self.combine_var.set(True)
+            self.amend_var.set(False)
+            self.excl_plan_var.set(True)
+            self.cluster_only_var.set(False)
+            self.min_stake_var.set("0")
+            self.min_sold_var.set("25")
+            self.excl_explained_var.set(True)
+            self.history_var.set(True)
+            self.hide_routine_var.set(True)
+            self.hide_sold_var.set(False)
+            self.excl_offer_var.set(True)
+            self.excl_entity_var.set(True)
+            self.hide_dups_var.set(True)
+            self.min_score_var.set("0")
+            self.min_price_var.set("1")
+            self.min_dvol_var.set("100")
+            self.view_var.set("top_sells")
+            self._user_sorted = False
+            self._view_changed()
+            self.status_var.set("Selling preset: open-market sales ≥ $250k, 30 days, 25%+ of the holding, no 10b5-1 "
+                                "plans, no explained or exercise-and-sell sales, no routine sellers. Click Start Scan.")
 
         def apply_preset(self):
             """Settings that isolate the kind of insider buying research links to returns."""
@@ -2924,6 +3472,10 @@ def run_gui() -> None:
             self.hide_dups_var.set(True)
             self.min_price_var.set("1")
             self.min_dvol_var.set("100")
+            self.min_sold_var.set("0")
+            self.excl_explained_var.set(False)
+            self.view_var.set("top_buys")
+            self._user_sorted = False
             self._view_changed()
             self.status_var.set("Preset applied: open-market buys ≥ $100k, 30 days, ≥ 2 insiders, no 10b5-1 plans, "
                                 "stake +10%, no routine buyers or later sellers, price ≥ $1, ≥ $100K/day traded. "
@@ -2935,6 +3487,7 @@ def run_gui() -> None:
             wrap.pack(fill="both", expand=True)
             cols = [c[0] for c in COLUMNS]
             self.tree = ttk.Treeview(wrap, columns=cols, show="headings", selectmode="extended")
+            self.tree.column("#0", width=30, minwidth=30, stretch=False)
             for key, head, width, anchor, _n in COLUMNS:
                 self.tree.heading(key, text=head, command=lambda k=key: self.sort_by(k))
                 self.tree.column(key, width=width, minwidth=44, anchor=anchor,
@@ -2947,13 +3500,6 @@ def run_gui() -> None:
             hs.grid(row=1, column=0, sticky="ew")
             wrap.rowconfigure(0, weight=1)
             wrap.columnconfigure(0, weight=1)
-            self.tree.tag_configure("Buy", background="#e8f6ec", foreground="#14532d")
-            self.tree.tag_configure("Sell", background="#fbeaea", foreground="#7f1d1d")
-            self.tree.tag_configure("Grant", background="#eef2fb")
-            self.tree.tag_configure("Exercise", background="#f6f1e7")
-            self.tree.tag_configure("hot", background="#c4ecd1", foreground="#0b3d20", font=self.bold_font)
-            self.tree.tag_configure("flip", background="#fdebd3", foreground="#8a4b08")
-            self.tree.tag_configure("routine", background="#eeeeee", foreground="#5f6670")
             self.tree.bind("<Double-1>", self._on_double)
             self.tree.bind("<Return>", lambda e: self.open_selected())
             self.tree.bind("<Button-3>", self._on_right_click)
@@ -2965,6 +3511,7 @@ def run_gui() -> None:
             self._tip = None
 
             self.ctx = tk.Menu(self.root, tearoff=0)
+            self._menus.append(self.ctx)
             self.ctx.add_command(label="Why this score?", command=self.explain_score)
             self.ctx.add_command(label="Open price chart (Yahoo Finance)", command=self.open_chart)
             self.ctx.add_separator()
@@ -2983,8 +3530,8 @@ def run_gui() -> None:
             f.pack(fill="x")
             self.summary_var = tk.StringVar(value="No results yet.")
             ttk.Label(f, textvariable=self.summary_var).pack(side="left")
-            ttk.Label(f, text="Bold green = cluster buy  •  Orange = sold since  •  Grey = routine  •  "
-                             "Double-click = open filing",
+            ttk.Label(f, text="Bold green = cluster buy  •  Bold red = strong sell warning  •  Orange = sold since / "
+                             "offering  •  Grey = routine  •  Double-click = open filing  •  Right-click = more",
                       style="Hint.TLabel").pack(side="right")
 
         # header tooltips ---------------------------------------------------
@@ -2993,8 +3540,15 @@ def run_gui() -> None:
                 self._hide_tip()
                 return
             col = self.tree.identify_column(event.x)
+            shown = list(self.tree["displaycolumns"])
+            if not shown or shown == ["#all"]:
+                shown = list(self.tree["columns"])
             try:
-                key = self.tree["columns"][int(col[1:]) - 1]
+                idx = int(col[1:]) - 1
+                if idx < 0:
+                    self._hide_tip()
+                    return
+                key = shown[idx]
             except (ValueError, IndexError):
                 return
             text = TOOLTIPS.get(key)
@@ -3004,7 +3558,7 @@ def run_gui() -> None:
             if self._tip is None:
                 self._tip = tk.Toplevel(self.root)
                 self._tip.wm_overrideredirect(True)
-                self._tip_label = tk.Label(self._tip, bg="#ffffe1", relief="solid", borderwidth=1,
+                self._tip_label = tk.Label(self._tip, bg=self.T["tip"], fg=self.T["fg"], relief="solid", borderwidth=1,
                                            padx=6, pady=3, wraplength=320, justify="left")
                 self._tip_label.pack()
             self._tip_label.config(text=text)
@@ -3068,6 +3622,9 @@ def run_gui() -> None:
                 "hidden_cols": sorted(self.hidden_cols),
                 "min_price": self.min_price_var.get(), "min_dvol": self.min_dvol_var.get(),
                 "hide_dups": self.hide_dups_var.get(),
+                "min_sold": self.min_sold_var.get(), "exclude_explained": self.excl_explained_var.get(),
+                "theme": self.theme_name, "view": self.view_var.get(),
+                "settings_hidden": not self.settings_frame.winfo_ismapped(),
                 "score_weights": {k: v for k, v in WEIGHTS.items() if v != DEFAULT_WEIGHTS.get(k)},
             })
 
@@ -3236,7 +3793,8 @@ def run_gui() -> None:
 
         def _values(self, r: dict) -> tuple:
             score = r.get("score")
-            return (r["filing_date"], r["ticker"], "" if score is None else score,
+            score_txt = "" if score is None else (f"▼ {score}" if r["code"] == "S" else score)
+            return (r["filing_date"], r["ticker"], score_txt,
                     r["company"], r["insider"], r["role"], r["title"],
                     r["side"], f"{r['shares']:,.0f}", fmt_money(r["price"], 2), fmt_money(r["value"]),
                     fmt_stake(r.get("stake")), r["cluster"],
@@ -3268,6 +3826,10 @@ def run_gui() -> None:
                 f.append("LowCash")
             if r.get("bm") is not None and r["bm"] < 0:
                 f.append("NegEq")
+            if r.get("explained"):
+                f.append("Explained")
+            if r.get("exercise_sell"):
+                f.append("Ex&Sell")
             return ", ".join(f)
 
         @staticmethod
@@ -3284,6 +3846,11 @@ def run_gui() -> None:
                 return ("routine",)
             if r["code"] == "P" and r["cluster"] >= 2 and not r.get("plan"):
                 return ("hot",)
+            if r["code"] == "S":
+                if r.get("pattern_kind") in ("routine", "regular"):
+                    return ("routine",)
+                if (r.get("score") or 0) >= 70:
+                    return ("hotsell",)
             return (r["side"],)
 
         def _insert(self, r: dict):
@@ -3292,8 +3859,8 @@ def run_gui() -> None:
             self.rows[iid] = r
             self.order.append(iid)
             self.by_cluster.setdefault(r["cluster_key"], []).append(iid)
-            if r["code"] == "P":
-                self.by_acc.setdefault(r["acc"], []).append(iid)
+            if r["code"] in ("P", "S"):
+                self.by_acc.setdefault(r.get("hkey", r["acc"]), []).append(iid)
             self.by_acc_all.setdefault(r["acc"], []).append(iid)
             if not self._visible(r):
                 self.tree.detach(iid)
@@ -3308,8 +3875,8 @@ def run_gui() -> None:
             r["cluster_disc"] = self.clusters.get(r["cluster_key"], (1, 1))[1]
             so = r.get("shares_out")
             r["cluster_pct_co"] = (self._cluster_shares(r) / so * 100.0) if so else None
-            if r["code"] == "P":
-                r["score"], r["score_why"] = signal_score(r)
+            if r["code"] in ("P", "S"):
+                r["score"], r["score_why"] = rate_row(r)
 
         def _visible(self, r: dict) -> bool:
             if self.only_ticker and r["ticker"] != self.only_ticker:
@@ -3327,11 +3894,20 @@ def run_gui() -> None:
             if self.excl_entity_var.get() and r.get("entity") and r["code"] == "P":
                 return False
             min_score = int(self.min_score_var.get() or 0) if self.min_score_var.get().isdigit() else 0
-            if min_score and r["code"] == "P" and (r.get("score") or 0) < min_score:
+            if min_score and r["code"] in ("P", "S") and (r.get("score") or 0) < min_score:
                 return False
             if self.max_mcap_var.get().isdigit() and r.get("mcap") and r["mcap"] > int(self.max_mcap_var.get()) * 1e6:
                 return False
             if self.hide_dups_var.get() and r.get("dup_of"):
+                return False
+            if r["code"] == "S":
+                ms = self.min_sold_var.get()
+                if ms.isdigit() and int(ms) > 0 and (r.get("stake") is None or r["stake"] > -int(ms)):
+                    return False
+                if self.excl_explained_var.get() and (r.get("explained") or r.get("exercise_sell")):
+                    return False
+            q = (self.search_var.get() or "").strip().lower() if hasattr(self, "search_var") else ""
+            if q and q not in f"{r['ticker']} {r['company']} {r['insider']} {r['title']}".lower():
                 return False
             try:
                 mp = float(self.min_price_var.get() or 0)
@@ -3363,29 +3939,157 @@ def run_gui() -> None:
 
         def _apply_view(self):
             self._view_job = None
-            attached = self.tree.get_children()
-            if attached:
-                self.tree.detach(*attached)
-            idx = 0
-            for iid in self.order:
-                if self._visible(self.rows[iid]):
-                    self.tree.move(iid, "", idx)
-                    idx += 1
+            tree, R = self.tree, self.rows
+            for g in self._groups:                       # take rows out of old groups, then drop the groups
+                kids = tree.get_children(g)
+                if kids:
+                    tree.detach(*kids)
+            if self._groups:
+                tree.delete(*self._groups)
+            self._groups = []
+            top = tree.get_children()
+            if top:
+                tree.detach(*top)
+            mode = self.view_var.get()
+            vis = [i for i in self.order if self._visible(R[i])]
+
+            def score(i):
+                v = R[i].get("score")
+                return -1 if v is None else v
+            grouped = mode in ("clusters", "company", "insider")
+            tree.configure(show=("tree headings" if grouped else "headings"))
+            if mode == "top_buys":
+                vis = [i for i in vis if R[i]["code"] == "P"]
+                if not self._user_sorted:
+                    vis.sort(key=lambda i: (score(i), R[i]["value"]), reverse=True)
+            elif mode == "top_sells":
+                vis = [i for i in vis if R[i]["code"] == "S"]
+                if not self._user_sorted:
+                    vis.sort(key=lambda i: (score(i), R[i]["value"]), reverse=True)
+            elif mode == "largest" and not self._user_sorted:
+                vis.sort(key=lambda i: R[i]["value"], reverse=True)
+            if not grouped:
+                for idx, i in enumerate(vis):
+                    tree.move(i, "", idx)
+            else:
+                groups: dict = {}
+                for i in vis:
+                    r = R[i]
+                    if mode == "clusters":
+                        if r["code"] != "P" or r["cluster"] < 2:
+                            continue
+                        k = r["cluster_key"]
+                    elif mode == "company":
+                        k = r.get("issuer_cik") or r["ticker"]
+                    else:
+                        k = r.get("owner_cik") or r["insider"].lower()
+                    groups.setdefault(k, []).append(i)
+                summ = sorted(((k, self._group_summary(mode, v)) for k, v in groups.items()),
+                              key=lambda x: x[1]["sort"], reverse=True)
+                for n, (k, sm) in enumerate(summ):
+                    gid = f"g:{n}"
+                    tree.insert("", "end", iid=gid, text="", values=sm["values"], tags=("group",),
+                                open=(mode == "clusters" or n < 10))
+                    self._groups.append(gid)
+                    kids = groups[k] if self._user_sorted else sorted(
+                        groups[k], key=lambda i: (score(i), R[i]["value"]), reverse=True)
+                    for j, i in enumerate(kids):
+                        tree.move(i, gid, j)
             self._update_summary()
 
+        def _group_summary(self, mode: str, iids: list) -> dict:
+            rows = [self.rows[i] for i in iids]
+            buys = [r for r in rows if r["code"] == "P"]
+            sells = [r for r in rows if r["code"] == "S"]
+            bv, sv = sum(r["value"] for r in buys), sum(r["value"] for r in sells)
+            best_b = max((r.get("score") or 0 for r in buys), default=None)
+            best_s = max((r.get("score") or 0 for r in sells), default=None)
+            first = max(rows, key=lambda r: (r.get("score") or 0, r["value"]))
+            insiders = {r.get("owner_cik") or r["insider"] for r in rows}
+            tickers = sorted({r["ticker"] for r in rows if r["ticker"]})
+            d = {k: "" for k in COL_KEYS}
+            d["filing_date"] = max(r["filing_date"] for r in rows)
+            d["shares"] = f"{sum(r['shares'] for r in rows):,.0f}"
+            if mode == "clusters":
+                d.update(ticker=first["ticker"], company=first["company"], score=best_b if best_b is not None else "",
+                         insider=(f"{first['cluster']} insiders buying" + (f" ({len(insiders)} shown)"
+                                                                            if len(insiders) != first["cluster"] else "")),
+                         side="Cluster",
+                         value=fmt_money(bv), cluster=first["cluster"],
+                         pct_co=fmt_pct(first.get("cluster_pct_co"), plus=False, digits=2),
+                         mcap=fmt_compact(first["mcap"]) if first.get("mcap") else "",
+                         net90=fmt_net90(first.get("net90")), role=", ".join(sorted({r["role"] for r in buys}))[:60])
+                return {"values": tuple(d[k] for k in COL_KEYS), "sort": (best_b or 0, bv)}
+            if mode == "company":
+                net = bv - sv
+                d.update(ticker=first["ticker"], company=first["company"],
+                         insider=f"{len(insiders)} insider{'s' if len(insiders) != 1 else ''}, {len(rows)} trade{'s' if len(rows) != 1 else ''}",
+                         side="Net buy" if net >= 0 else "Net sell",
+                         value=("+" if net >= 0 else "−") + fmt_money(abs(net)),
+                         score=best_b if best_b is not None else (f"▼ {best_s}" if best_s is not None else ""),
+                         mcap=fmt_compact(first["mcap"]) if first.get("mcap") else "",
+                         net90=fmt_net90(first.get("net90")), cluster=max(r["cluster"] for r in rows))
+                return {"values": tuple(d[k] for k in COL_KEYS), "sort": (net, best_b or 0)}
+            side = "Buyer" if buys and not sells else ("Seller" if sells and not buys else "Bought & sold")
+            d.update(insider=first["insider"], role=first["role"], title=first["title"],
+                     ticker=", ".join(tickers)[:24], side=side,
+                     company=f"{len(rows)} trade{'s' if len(rows) != 1 else ''} in {len(tickers)} compan{'ies' if len(tickers) != 1 else 'y'}",
+                     value=fmt_money(bv + sv),
+                     score=best_b if best_b is not None else (f"▼ {best_s}" if best_s is not None else ""))
+            return {"values": tuple(d[k] for k in COL_KEYS), "sort": (bv + sv,)}
+
+        def _displayed(self) -> list[str]:
+            """Row iids in on-screen order (inside groups too)."""
+            out = []
+            for i in self.tree.get_children(""):
+                if i in self.rows:
+                    out.append(i)
+                else:
+                    out.extend(self.tree.get_children(i))
+            return out
+
+        def _sel(self) -> list[str]:
+            """Selected rows; a selected group counts as all its rows."""
+            out = []
+            for i in self.tree.selection():
+                if i in self.rows:
+                    out.append(i)
+                else:
+                    out.extend(self.tree.get_children(i))
+            return list(dict.fromkeys(out))
+
         def _visible_rows(self) -> list[dict]:
-            return [self.rows[i] for i in self.tree.get_children()]
+            return [self.rows[i] for i in self._displayed()]
+
+        def _set_card(self, key: str, value: str, detail: str = " "):
+            c = self._cards_w.get(key)
+            if c:
+                c["value"].configure(text=value)
+                c["detail"].configure(text=detail)
 
         def _update_summary(self):
             vis = self._visible_rows()
             total = len(self.rows)
+            buys_c = [r for r in vis if r["code"] == "P"]
+            sells_c = [r for r in vis if r["code"] == "S"]
+            self._set_card("shown", f"{len(vis):,}", f"of {total:,} found" if total else "run a scan")
+            self._set_card("buys", f"{len(buys_c):,}", fmt_compact(sum(r["value"] for r in buys_c)) if buys_c else " ")
+            self._set_card("sells", f"{len(sells_c):,}", fmt_compact(sum(r["value"] for r in sells_c)) if sells_c else " ")
+            cl = {r["cluster_key"] for r in buys_c if r["cluster"] >= 2}
+            self._set_card("clusters", f"{len(cl):,}", "2+ insiders buying" if cl else " ")
+            bb = max(buys_c, key=lambda r: r.get("score") or -1, default=None)
+            self._set_card("best", "—" if not bb or bb.get("score") is None else str(bb["score"]),
+                           f"{bb['ticker']} · {bb['insider'][:22]}" if bb and bb.get("score") is not None else " ")
+            ws = max(sells_c, key=lambda r: r.get("score") or -1, default=None)
+            self._set_card("warn", "—" if not ws or ws.get("score") is None else f"▼ {ws['score']}",
+                           f"{ws['ticker']} · {ws['insider'][:22]}" if ws and ws.get("score") is not None else " ")
             if not total:
                 self.summary_var.set("No matching trades yet.")
                 return
             buys = [r for r in vis if r["code"] == "P"]
             sells = [r for r in vis if r["code"] == "S"]
             clusters = {r["ticker"] for r in buys if r["cluster"] >= 2}
-            txt = f"Showing {len(vis):,} of {total:,} trades"
+            txt = f"{dict(VIEWS).get(self.view_var.get(), '')}: showing {len(vis):,} of {total:,} trades"
             strong = sum(1 for r in buys if (r.get("score") or 0) >= 70)
             if strong:
                 txt += f"   •   Score 70+: {strong:,}"
@@ -3398,6 +4102,7 @@ def run_gui() -> None:
 
         def clear_results(self):
             self.tree.delete(*self.tree.get_children())
+            self._groups = []
             for iid in list(self.rows):
                 if self.tree.exists(iid):
                     self.tree.delete(iid)
@@ -3415,6 +4120,7 @@ def run_gui() -> None:
 
         # ---- sorting -------------------------------------------------------
         def sort_by(self, key: str):
+            self._user_sorted = True
             numeric = next(c[4] for c in COLUMNS if c[0] == key)
             if self.sort_key == key:
                 self.sort_desc = not self.sort_desc
@@ -3461,7 +4167,7 @@ def run_gui() -> None:
             if self.tree.identify_region(event.x, event.y) not in ("cell", "tree"):
                 return
             iid = self.tree.identify_row(event.y)
-            if iid:
+            if iid and iid in self.rows:
                 webbrowser.open(self.rows[iid]["link"])
 
         def _apply_columns(self):
@@ -3500,15 +4206,20 @@ def run_gui() -> None:
                 self.ctx.tk_popup(event.x_root, event.y_root)
 
         def explain_score(self):
-            sel = self.tree.selection()
+            sel = self._sel()
             if not sel:
                 return
             r = self.rows[sel[0]]
             if r.get("score") is None:
-                messagebox.showinfo(APP_NAME, "Scores are calculated for open-market purchases (Code P) only.")
+                messagebox.showinfo(APP_NAME, "Scores are calculated for open-market purchases (Code P) and "
+                                              "sales (Code S) only.")
                 return
-            lines = [f"{r['ticker']} - {r['insider']} - {fmt_money(r['value'])}", "",
-                     f"Signal Score: {r['score']} / 100", "", "+40  starting point"]
+            if r["code"] == "S":
+                lines = [f"{r['ticker']} - {r['insider']} - sold {fmt_money(r['value'])}", "",
+                         f"Sell Score (warning strength): {r['score']} / 100", "", f"+{SELL_BASE}  starting point"]
+            else:
+                lines = [f"{r['ticker']} - {r['insider']} - {fmt_money(r['value'])}", "",
+                         f"Signal Score: {r['score']} / 100", "", f"+{SCORE_BASE}  starting point"]
             lines += r.get("score_why") or []
             if not r.get("prices_ok") and r.get("deep"):
                 lines += ["", "(No price data - price-based points not included.)"]
@@ -3517,7 +4228,7 @@ def run_gui() -> None:
             messagebox.showinfo(APP_NAME, "\n".join(lines))
 
         def open_chart(self):
-            sel = self.tree.selection()
+            sel = self._sel()
             if sel:
                 sym = yahoo_symbol(self.rows[sel[0]]["ticker"])
                 if sym:
@@ -3537,7 +4248,7 @@ def run_gui() -> None:
             self._view_changed()
 
         def filter_to_ticker(self):
-            sel = self.tree.selection()
+            sel = self._sel()
             if sel:
                 self.only_ticker = self.rows[sel[0]]["ticker"]
                 self._apply_view()
@@ -3547,17 +4258,17 @@ def run_gui() -> None:
             self._apply_view()
 
         def open_selected(self, index: bool = False):
-            for iid in self.tree.selection()[:10]:
+            for iid in self._sel()[:10]:
                 webbrowser.open(self.rows[iid]["index_link" if index else "link"])
 
         def copy_link(self):
-            sel = self.tree.selection()
+            sel = self._sel()
             if sel:
                 self.root.clipboard_clear()
                 self.root.clipboard_append("\n".join(self.rows[i]["link"] for i in sel))
 
         def copy_selected(self):
-            sel = self.tree.selection()
+            sel = self._sel()
             if not sel:
                 return
             lines = ["\t".join(CSV_HEADERS)]
@@ -3566,7 +4277,7 @@ def run_gui() -> None:
             self.root.clipboard_append("\n".join(lines))
 
         def export_csv(self):
-            vis = self.tree.get_children()
+            vis = self._displayed()
             if not vis:
                 messagebox.showinfo(APP_NAME, "There are no results to export yet.")
                 return
@@ -3646,6 +4357,10 @@ def run_gui() -> None:
                 "• File > Back-test Signal Score replays years of SEC insider data, measures 1/3/6-month returns "
                 "vs SPY by score band and by factor, and can apply weights tuned on the first half of the period "
                 "(checked on the second half).\n\n"
+                "• Sales get a Sell Score (▼, higher = stronger warning): large share of the holding sold, "
+                "discretionary (no plan, no explanation like taxes or estate planning), not exercise-and-sell, "
+                "non-routine seller, CEO/CFO, after a run-up or near the 52-week high, late in the quarter. "
+                "Use the ▼ Insider Selling preset and the 'Top sells' view.\n\n"
                 "• Also scored: the insider's own past record, buys after an earnings drop, book/market, low cash, "
                 "late filings and thin trading. Duplicate filings by related owners count once.\n\n"
                 "The ★ preset sets: open-market buys only, ≥ $100k, last 30 days, all roles, "
@@ -3701,7 +4416,15 @@ def run_gui() -> None:
             ttk.Entry(ctl, textvariable=self.max_var, width=7).grid(row=0, column=9, padx=(4, 18))
             self.company_var = tk.BooleanVar(value=st.get("bt_company", True))
             ttk.Checkbutton(ctl, text="Include company data (size, value, cash, 13D, earnings timing)",
-                            variable=self.company_var).grid(row=1, column=0, columnspan=8, sticky="w", pady=(6, 0))
+                            variable=self.company_var).grid(row=1, column=0, columnspan=6, sticky="w", pady=(6, 0))
+            side_f = ttk.Frame(ctl)
+            side_f.grid(row=1, column=6, columnspan=5, sticky="w", pady=(6, 0))
+            ttk.Label(side_f, text="Test:").pack(side="left", padx=(0, 6))
+            self.side_var = tk.StringVar(value=st.get("bt_side", "P"))
+            ttk.Radiobutton(side_f, text="Buy Signal Score", value="P", variable=self.side_var,
+                            style="Seg.Toolbutton").pack(side="left")
+            ttk.Radiobutton(side_f, text="▼ Sell Score", value="S", variable=self.side_var,
+                            style="Seg.Toolbutton").pack(side="left", padx=(2, 0))
             ttk.Label(ctl, style="Hint.TLabel", wraplength=1180, justify="left", text=(
                 "Downloads SEC's quarterly insider data sets (~10-40 MB each, kept for next time) and daily prices "
                 "for each ticker. A first run with 2,000 signals takes roughly 10-20 minutes; later runs reuse the "
@@ -3710,7 +4433,7 @@ def run_gui() -> None:
 
             act = ttk.Frame(self.win, padding=(12, 4))
             act.pack(fill="x")
-            self.run_btn = ttk.Button(act, text="▶  Run back-test", style="Big.TButton", command=self.run)
+            self.run_btn = ttk.Button(act, text="▶  Run back-test", style="Accent.TButton", command=self.run)
             self.run_btn.pack(side="left")
             self.cancel_btn = ttk.Button(act, text="■  Cancel", style="Big.TButton", command=self.cancel, state="disabled")
             self.cancel_btn.pack(side="left", padx=8)
@@ -3727,7 +4450,7 @@ def run_gui() -> None:
             self.t_bands = self._table(nb, "By score band", [
                 ("band", "Score band", 110, "w"), ("n", "Signals", 70, "e"), ("ret1M", "1M return", 90, "e"),
                 ("ret3M", "3M return", 90, "e"), ("ret6M", "6M return", 90, "e"), ("ex1M", "1M vs SPY", 90, "e"),
-                ("ex3M", "3M vs SPY", 90, "e"), ("ex6M", "6M vs SPY", 90, "e"), ("hit6", "Beat SPY (6M)", 110, "e")])
+                ("ex3M", "3M vs SPY", 90, "e"), ("ex6M", "6M vs SPY", 90, "e"), ("hit6", "Beat SPY (6M)", 160, "e")])
             self.t_factors = self._table(nb, "By factor", [
                 ("label", "Factor", 340, "w"), ("current", "Points now", 96, "e"), ("n_with", "Signals with", 104, "e"),
                 ("with", "6M vs SPY with", 128, "e"), ("without", "without", 90, "e"),
@@ -3744,7 +4467,9 @@ def run_gui() -> None:
 
             bot = ttk.Frame(self.win, padding=(12, 4, 12, 10))
             bot.pack(fill="x")
-            self.apply_btn = ttk.Button(bot, text="Apply suggested weights", command=self.apply, state="disabled")
+            app.theme_window(self.win, [self.t_bands, self.t_factors, self.t_test, self.t_rows])
+            self.apply_btn = ttk.Button(bot, text="Apply suggested weights", style="Accent.TButton",
+                                        command=self.apply, state="disabled")
             self.apply_btn.pack(side="left")
             ttk.Button(bot, text="Reset to default weights", command=self.reset).pack(side="left", padx=8)
             ttk.Button(bot, text="Export signals CSV...", command=self.export).pack(side="left")
@@ -3789,13 +4514,13 @@ def run_gui() -> None:
                 params = BacktestParams(start_q=a, end_q=b, user_agent=ua, warmup_quarters=int(self.warm_var.get()),
                                         min_value=float(self.min_var.get().replace(",", "") or 0),
                                         max_signals=int(self.max_var.get().replace(",", "") or 0),
-                                        company_data=self.company_var.get())
+                                        company_data=self.company_var.get(), side=self.side_var.get())
             except (ValueError, tk.TclError):
                 messagebox.showwarning(APP_NAME, "Please check the numbers in Settings.", parent=self.win)
                 return
             self.app.settings.update({"bt_start": a.upper(), "bt_end": b.upper(), "bt_warmup": params.warmup_quarters,
                                       "bt_min": self.min_var.get(), "bt_max": self.max_var.get(),
-                                      "bt_company": params.company_data})
+                                      "bt_company": params.company_data, "bt_side": params.side})
             self.cancel_event = threading.Event()
             self.run_btn.config(state="disabled")
             self.cancel_btn.config(state="normal")
@@ -3846,29 +4571,37 @@ def run_gui() -> None:
 
         def _render(self, res):
             p = res["params"]
+            sells = p.get("side") == "S"
+            self.t_bands.heading("hit6", text="Lagged SPY (6M)" if sells else "Beat SPY (6M)")
             miss = f"  •  missing data sets: {', '.join(res['missing_quarters'])}" if res["missing_quarters"] else ""
-            self.status.set(f"Done: {res['signals']:,} signals {p['start']}-{p['end']} (of {res['candidates']:,} "
-                            f"purchases ≥ ${p['min_value']:,.0f}), {res['priced6']:,} with 6-month results{miss}.")
+            self.status.set(f"Done: {res['signals']:,} {'sale' if sells else 'buy'} signals {p['start']}-{p['end']} "
+                            f"(of {res['candidates']:,} {'sales' if sells else 'purchases'} ≥ ${p['min_value']:,.0f}), "
+                            f"{res['priced6']:,} with 6-month results{miss}.")
             self.progress.config(value=self.progress.cget("maximum"))
             allb = res["bands"]["All"]
             self.summary.set(
-                f"All signals: 6-month return {self._pct(allb['ret6M'])}, vs SPY {self._pct(allb['ex6M'])}, beat SPY "
+                ("Sell Score: a good warning is followed by LOWER returns, so look for higher bands lagging SPY more.  "
+                 if sells else "") +
+                f"All signals: 6-month return {self._pct(allb['ret6M'])}, vs SPY {self._pct(allb['ex6M'])}, "
+                f"{'lagged' if sells else 'beat'} SPY "
                 f"{'' if allb['hit6'] is None else format(allb['hit6'], '.0f') + '%'} of the time.  "
                 f"Related-owner duplicates removed: {res['dups']:,}.  Train/test split at {res['split_date'] or 'n/a'}.")
             t = self.t_bands
             t.delete(*t.get_children())
             for band in ("70+", "50-69", "under 50", "All"):
                 b = res["bands"][band]
-                tag = ("good",) if (b["ex6M"] or 0) > 0 else (("bad",) if b["ex6M"] is not None else ())
+                good = (b["ex6M"] or 0) < 0 if sells else (b["ex6M"] or 0) > 0
+                tag = ("good",) if good and b["ex6M"] is not None else (("bad",) if b["ex6M"] is not None else ())
                 t.insert("", "end", tags=tag, values=(band, f"{b['n']:,}", *(self._pct(b[k]) for k in
                          ("ret1M", "ret3M", "ret6M", "ex1M", "ex3M", "ex6M")),
                          "" if b["hit6"] is None else f"{b['hit6']:.0f}%  (n={b['n6']})"))
             t = self.t_factors
             t.delete(*t.get_children())
             sugg = res["suggested"]
-            for f in sorted(res["factors"], key=lambda x: -(x["uplift"] if x["uplift"] is not None else -999)):
+            sgn = -1 if sells else 1
+            for f in sorted(res["factors"], key=lambda x: -(sgn * x["uplift"] if x["uplift"] is not None else -999)):
                 s_ = sugg.get(f["key"])
-                tag = ("dim",) if not f["enough"] else (("good",) if (f["uplift"] or 0) > 0 else ("bad",))
+                tag = ("dim",) if not f["enough"] else (("good",) if sgn * (f["uplift"] or 0) > 0 else ("bad",))
                 t.insert("", "end", tags=tag, values=(
                     f["label"], f"{f['current']:+d}", f"{f['n_with']:,}", self._pct(f["with"]), self._pct(f["without"]),
                     self._pct(f["uplift"]), "too few signals" if s_ is None else f"{s_:+d}"))
@@ -3881,7 +4614,8 @@ def run_gui() -> None:
             t.delete(*t.get_children())
             for r in sorted(res["rows"], key=lambda r: -(r.get("score") or 0))[:5000]:
                 ex6 = r.get("ex6M")
-                tag = ("good",) if (ex6 or 0) > 0 else (("bad",) if ex6 is not None else ())
+                ok = (ex6 or 0) < 0 if sells else (ex6 or 0) > 0
+                tag = ("good",) if (ok and ex6 is not None) else (("bad",) if ex6 is not None else ())
                 t.insert("", "end", tags=tag, values=(
                     r["filing_date"], r["ticker"], r.get("insider", ""), fmt_money(r.get("value") or 0), r.get("score"),
                     self._pct(r.get("ret1M"), 0), self._pct(r.get("ret3M"), 0), self._pct(r.get("ret6M"), 0),
@@ -3892,7 +4626,7 @@ def run_gui() -> None:
             if not self.result or not self.result["suggested"]:
                 return
             sugg = self.result["suggested"]
-            lines = [f"{FACTORS[k][1]}: {WEIGHTS[k]:+d} → {v:+d}" for k, v in sugg.items() if v != WEIGHTS.get(k)]
+            lines = [f"{ALL_FACTORS[k][1]}: {WEIGHTS[k]:+d} → {v:+d}" for k, v in sugg.items() if v != WEIGHTS.get(k)]
             if not lines:
                 messagebox.showinfo(APP_NAME, "The suggested weights match the ones in use.", parent=self.win)
                 return
@@ -3926,8 +4660,9 @@ def run_gui() -> None:
 
     class TrackRecordWindow:
         """How past signals have done since the insider bought, vs SPY, grouped by score band."""
-        COLS = [("first_seen", "Logged", 90, "w"), ("ticker", "Ticker", 64, "w"), ("insider", "Insider", 170, "w"),
-                ("buy_date", "Buy Date", 90, "w"), ("price", "Paid", 76, "e"), ("score", "Score", 56, "center"),
+        COLS = [("first_seen", "Logged", 90, "w"), ("side", "Side", 56, "center"), ("ticker", "Ticker", 64, "w"),
+                ("insider", "Insider", 170, "w"),
+                ("buy_date", "Trade Date", 90, "w"), ("price", "Price", 76, "e"), ("score", "Score", 56, "center"),
                 ("pattern", "Pattern", 200, "w"), ("now", "Last", 76, "e"), ("ret", "Return", 76, "e"),
                 ("spy", "SPY", 70, "e"), ("excess", "vs SPY", 76, "e"), ("days", "Days", 54, "e")]
 
@@ -3948,10 +4683,11 @@ def run_gui() -> None:
             ttk.Label(self.win, textvariable=self.summary, padding=(12, 2), justify="left",
                       font=(app.base_font[0], app.base_font[1])).pack(fill="x")
             ttk.Label(self.win, padding=(12, 0, 12, 6), style="Hint.TLabel", wraplength=1120, justify="left",
-                      text="Every open-market buy that received a score in a completed scan is logged once, with its "
-                           "score at the time. Return = from the insider's purchase price to the latest close "
-                           "(split/dividend adjusted). SPY = the S&P 500 ETF over the same dates. Double-click a row "
-                           "for its price chart.").pack(fill="x")
+                      text="Every open-market buy and sale that received a score in a completed scan is logged once, "
+                           "with its score at the time. Return = from the insider's price to the latest close "
+                           "(split/dividend adjusted). SPY = the S&P 500 ETF over the same dates. For sales, a good "
+                           "warning is one where the stock then lagged SPY. Double-click a row for its price chart."
+                      ).pack(fill="x")
             wrap = ttk.Frame(self.win, padding=(12, 0, 12, 10))
             wrap.pack(fill="both", expand=True)
             self.tree = ttk.Treeview(wrap, columns=[c[0] for c in self.COLS], show="headings")
@@ -3962,13 +4698,14 @@ def run_gui() -> None:
             self.tree.configure(yscrollcommand=vs.set)
             self.tree.pack(side="left", fill="both", expand=True)
             vs.pack(side="right", fill="y")
-            self.tree.tag_configure("up", foreground="#14532d")
-            self.tree.tag_configure("down", foreground="#7f1d1d")
+            app.theme_window(self.win, [self.tree])
             self.tree.bind("<Double-1>", self._open)
             self.sort_key, self.sort_desc = "buy_date", True
             log = SignalLog()
             self.items = log.all()
             log.close()
+            for x in self.items:
+                x["side"] = x.get("side") or "P"
             self.render()
             if self.items:
                 self.refresh()
@@ -3982,10 +4719,12 @@ def run_gui() -> None:
                 v = x.get(self.sort_key)
                 return (v is None, v if v is not None else 0)
             for x in sorted(self.items, key=key, reverse=self.sort_desc):
-                ret = x.get("ret")
-                tag = ("up",) if (ret or 0) > 0 else (("down",) if ret is not None else ())
+                ret, exc = x.get("ret"), x.get("excess")
+                sell = (x.get("side") or "P") == "S"
+                ok = ((exc if exc is not None else ret) or 0) < 0 if sell else (ret or 0) > 0
+                tag = ("up",) if (ok and ret is not None) else (("down",) if ret is not None else ())
                 self.tree.insert("", "end", iid=x["acc"], tags=tag, values=(
-                    x["first_seen"], x["ticker"], x["insider"], x["buy_date"],
+                    x["first_seen"], "▼ Sell" if sell else "Buy", x["ticker"], x["insider"], x["buy_date"],
                     fmt_money(x["price"] or 0, 2), x["score"], x.get("pattern", ""),
                     fmt_money(x["now"], 2) if x.get("now") else "", fmt_pct(ret, digits=1),
                     fmt_pct(x.get("spy"), digits=1), fmt_pct(x.get("excess"), digits=1),
@@ -3995,16 +4734,19 @@ def run_gui() -> None:
         def _summarise(self):
             if not self.items:
                 return
-            summ = track_record_summary(self.items)
             lines = []
-            for band in ("70+", "50-69", "under 50"):
-                b = summ.get(band)
-                if not b:
-                    lines.append(f"Score {band}:  no priced signals yet")
+            for side, title, verb in (("P", "Buys", "beat"), ("S", "Sells (▼ a good warning lags SPY)", "lagged")):
+                summ = track_record_summary(self.items, side)
+                if not any(summ.values()):
                     continue
-                vs = "" if b["avg_excess"] is None else f",  vs SPY {b['avg_excess']:+.1f}%,  beat SPY {b['beat']:.0f}% of the time"
-                lines.append(f"Score {band}:  {b['n']} signals,  average return {b['avg']:+.1f}%{vs}")
-            self.summary.set("\n".join(lines))
+                lines.append(title)
+                for band in ("70+", "50-69", "under 50"):
+                    b = summ.get(band)
+                    if not b:
+                        continue
+                    vs = "" if b["avg_excess"] is None else f",  vs SPY {b['avg_excess']:+.1f}%,  {verb} SPY {b['beat']:.0f}% of the time"
+                    lines.append(f"    Score {band}:  {b['n']} signals,  average return {b['avg']:+.1f}%{vs}")
+            self.summary.set("\n".join(lines) or "Prices not available yet.")
 
         def sort(self, key):
             self.sort_desc = (not self.sort_desc) if self.sort_key == key else True
@@ -4082,10 +4824,11 @@ def run_gui() -> None:
                 return
             with open(path, "w", newline="", encoding="utf-8-sig") as fh:
                 w = csv.writer(fh)
-                w.writerow(["Logged", "Ticker", "Company", "Insider", "Buy Date", "Paid", "Value", "Score",
+                w.writerow(["Logged", "Side", "Ticker", "Company", "Insider", "Trade Date", "Price", "Value", "Score",
                             "Pattern", "Cluster", "Last", "Return %", "SPY %", "vs SPY %", "Days", "Accession"])
                 for x in self.items:
-                    w.writerow([x["first_seen"], x["ticker"], x["company"], x["insider"], x["buy_date"], x["price"],
+                    w.writerow([x["first_seen"], "Sell" if (x.get("side") or "P") == "S" else "Buy", x["ticker"],
+                                x["company"], x["insider"], x["buy_date"], x["price"],
                                 x["value"], x["score"], x.get("pattern", ""), x.get("cluster", ""), x.get("now", ""),
                                 "" if x.get("ret") is None else round(x["ret"], 2),
                                 "" if x.get("spy") is None else round(x["spy"], 2),
@@ -4125,13 +4868,12 @@ def apply_signal_filters(rows: list, clusters: dict, exclude_plan: bool, min_clu
         so = r.get("shares_out")
         csh = (c[4] if exclude_plan else c[2]) if len(c) >= 6 else r["shares"]
         r["cluster_pct_co"] = (csh / so * 100.0) if so else None
-        if r["code"] == "P":
-            r["score"], r["score_why"] = signal_score(r)
+        r["score"], r["score_why"] = rate_row(r)
         if exclude_offering and r.get("offering"):
             continue
         if exclude_entity and r.get("entity") and r["code"] == "P":
             continue
-        if min_score and r["code"] == "P" and (r.get("score") or 0) < min_score:
+        if min_score and r["code"] in ("P", "S") and (r.get("score") or 0) < min_score:
             continue
         if exclude_plan and r.get("plan"):
             continue
@@ -4157,12 +4899,13 @@ def run_backtest_cli(argv: list[str]) -> int:
     ap.add_argument("--min", type=float, default=100000)
     ap.add_argument("--max-signals", type=int, default=2000)
     ap.add_argument("--no-company-data", action="store_true")
+    ap.add_argument("--sells", action="store_true", help="test the Sell Score instead of the buy Signal Score")
     ap.add_argument("--csv")
     a = ap.parse_args(argv)
     set_weights(load_settings().get("score_weights"))
     q: queue.Queue = queue.Queue()
     bt = Backtester(BacktestParams(a.start.lower(), a.end.lower(), a.ua, a.warmup, a.min, a.max_signals,
-                                   not a.no_company_data), q, threading.Event())
+                                   not a.no_company_data, "S" if a.sells else "P"), q, threading.Event())
     t = threading.Thread(target=bt.run, daemon=True)
     t.start()
     res = None
@@ -4268,8 +5011,8 @@ def run_cli(argv: list[str]) -> int:
     except KeyboardInterrupt:
         cancel.set()
     for r in rows:
-        if r["code"] == "P" and r["acc"] in history:
-            r.update(history[r["acc"]])
+        if r.get("hkey") in history:
+            r.update(history[r["hkey"]])
     rows = apply_signal_filters(rows, clusters, a.exclude_plan, a.clusters, a.min_stake,
                                 a.hide_routine, a.hide_sold, a.exclude_offering, a.exclude_funds, a.min_score)
     rows.sort(key=lambda r: (r.get("score") or -1, r["value"]), reverse=True)

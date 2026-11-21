@@ -14,9 +14,27 @@ A Windows desktop app that scans SEC EDGAR Form 4 filings for insider buys and s
 
 Every push to `main` rebuilds the app on GitHub Actions and replaces the *latest* release.
 
+## The main screen
+* **Header toolbar:** ★ Insider Buying preset, ▼ Insider Selling preset, Track Record, Back-test, Export CSV and **Theme**. The themes are Light, Dark, Midnight Blue and Sepia (warm). Dark themes also darken the Windows title bar.
+* **Show / hide settings** (Ctrl+H) collapses the scan settings so the results get the whole window.
+* **Summary cards:** trades shown, open-market buys and sales ($), cluster-buy companies, the best buy score and the strongest sell warning.
+* **View bar**, to reorganize the same results instantly:
+
+| View | What it shows |
+|---|---|
+| All trades | Every row, sorted by score (click headers to re-sort) |
+| Top buys / Top sells | Buys ranked by Signal Score / sales ranked by Sell Score |
+| Cluster buys | One expandable group per company where 2+ insiders bought, with the buyers inside |
+| By company | Every company with net insider $ (buys − sales), with its trades inside |
+| By insider | The week's biggest buyers and sellers by total $, with their trades inside |
+| Largest $ | Biggest trades first |
+
+* **Search** filters by ticker, company, insider or title as you type.
+* **Expand all / Collapse all** open or close every group in the grouped views.
+
 ## Finding true insider buying
 
-Click **★ True Insider Buying preset**, then **Start Scan**. The preset sets:
+Click **★ Insider Buying** (the True Insider Buying preset), then **Start Scan**. The preset sets:
 
 | Setting | Value | Why |
 |---|---|---|
@@ -67,6 +85,7 @@ The back-test replays SEC's quarterly **Insider Transactions Data Sets**, the of
 * Every qualifying buy is scored **as of its filing date**, using only information that was public then. A second buyer counts toward a cluster only once their Form 4 had been filed. Pattern, insider record, net flow, earnings and company data all come from the past.
 * It measures the **1-, 3- and 6-month returns** from the filing date, and the same for SPY.
 * It shows results by **score band**, then by **factor**: the average 6-month return vs SPY with and without each factor, and the points that difference suggests.
+* **Test: Buy Signal Score / ▼ Sell Score** chooses which score to back-test. For sales, the suggested points reward factors that preceded *worse* returns.
 * **Train / test check:** suggested weights are tuned on the first half of the period, then both the current and suggested weights are scored on the second half. Apply them only if they also ranked the second half better. A factor needs 30+ signals each way before any change is suggested. **Reset to default weights** at any time.
 * Company size, book value and cash come from SEC XBRL *frames*, which return one figure for every company in a single request. They use figures from two quarters before each filing, so they had already been published. Prices come from Yahoo.
 * **Caveats:**
@@ -74,6 +93,35 @@ The back-test replays SEC's quarterly **Insider Transactions Data Sets**, the of
   * Factor comparisons are simple one-at-a-time differences.
   * The sample is random when there are more signals than the "Max signals" setting.
   * Downloads are kept in `%LOCALAPPDATA%\Form4Scanner\bulk`.
+
+## Spotting significant insider selling
+Most insider sales are noise: diversification, taxes, buying a house. Research finds that the sales worth noticing are **large relative to the insider's holding** and **discretionary**, meaning not pre-planned and not explained. Click **▼ Insider Selling** for a preset that:
+* scans open-market sales of $250k+ over the last 30 days;
+* hides 10b5-1 plan sales, offering sales, and sales by funds or companies;
+* hides **explained** sales (a footnote cites taxes, estate planning, divorce, gifts, vesting and so on);
+* hides **exercise-and-sell** sales (options exercised and sold the same day);
+* hides routine sellers;
+* keeps only sales of **25%+ of the holding**;
+* opens the **Top sells** view.
+
+Every sale gets a **Sell Score** (shown as ▼ 0–100; higher means a stronger warning). It starts at 30:
+
+| Factor | Points |
+|---|---|
+| Sold the entire position / 50%+ / 25%+ of the holding; under 5% | +22 / +15 / +8; −8 |
+| Discretionary (no plan, no explanation) | +8 |
+| Explained in a footnote / 10b5-1 plan / exercise-and-sell | −10 / −12 / −12 |
+| CEO or CFO seller (director) | +8 (+3) |
+| Sale of $1M+ / $5M+ | +4 / +8 |
+| First sale in 5+ years / opportunistic / regular / routine seller | +10 / +6 / −8 / −15 |
+| 2 / 3+ insiders selling (a weak signal for sales) | +2 / +4 |
+| Stock up 30%+ in the 3 months before / sold within 5% of the 52-week high | +5 / +4 |
+| Sold late in the quarter, ahead of the next earnings report | +5 |
+| Insiders heavy net sellers / net buyers over 90 days | +4 / −4 |
+| Fund or company seller / sold in a registered offering | −8 / −15 |
+| Form 4 filed 10+ business days late | +3 |
+
+Offering sales are capped at 30. Exercise-and-sell is capped at 40. Plan, explained and routine sales are capped at 45. The deep check (seller history, prices and so on) runs for sales that look significant: 10%+ of the holding or $1M+, and not under a plan. The Track Record and back-test handle sales too. There, a *good* sell warning is one where the stock then **lagged** SPY. Use sell signals as a prompt to look harder at stocks you own or watch, not as a short-selling system.
 
 ### Signal Track Record
 *File → Signal Track Record* (Ctrl+T) lists every scored buy from your completed scans, each logged once with its score at the time. It shows the return from the insider's purchase price to today and **SPY over the same dates**, with a summary by score band: average return, average vs SPY, and % beating SPY. Clearing the download cache doesn't delete this history.
@@ -120,6 +168,7 @@ Requires Python 3.9+ and nothing else (standard library only).
 ```
 python form4_scanner.py                 # GUI
 python form4_scanner.py --backtest 2025Q2 2026Q1 --ua "Jane Doe jane@example.com" --csv backtest.csv
+python form4_scanner.py --backtest 2025Q2 2026Q1 --sells --ua "Jane Doe jane@example.com"
 python form4_scanner.py --cli --ua "Jane Doe jane@example.com" --days 30 --codes P --min 100000 --exclude-plan --clusters 2 --min-stake 10 --hide-routine --hide-sold --exclude-offering --exclude-funds --min-score 60 --csv out.csv
 python tests/test_scanner.py            # offline tests (mocked SEC responses)
 ```
