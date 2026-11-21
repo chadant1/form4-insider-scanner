@@ -4,7 +4,7 @@
 #define MyAppName "SEC Form 4 Insider Scanner"
 #define MyAppExe "Form4Scanner.exe"
 #ifndef AppVersion
-  #define AppVersion "1.4.0"
+  #define AppVersion "1.5.0"
 #endif
 
 [Setup]
