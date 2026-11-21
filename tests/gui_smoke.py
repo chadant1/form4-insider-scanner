@@ -1,99 +1,121 @@
-"""Manual GUI smoke test (Linux + Xvfb). Not run in CI."""
-import os, subprocess, sys, time
+"""Manual GUI smoke test (Linux + Xvfb): python tests/gui_smoke.py OUTPUT_DIR. Not run in CI."""
+import os
+import subprocess
+import sys
+import time
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = sys.argv[1] if len(sys.argv) > 1 else "/tmp"
 _src = open(os.path.join(HERE, "test_scanner.py")).read()
-exec(_src.split("# 1. Market-wide default")[0])                     # fixtures + mocked SEC
-_h = _src.split("HIST = 424242", 1)[1].split("CALLS.clear()")[0]   # history fixtures (company HIST)
-exec("HIST = 424242" + _h)
-_g = _src.split("SIG = 777001", 1)[1].split("F.Cache.clear_all()")[0]   # v1.3 fixtures (company SIGL)
-exec("SIG = 777001" + _g)
-exec("ERN = 888101" + _src.split("ERN = 888101", 1)[1].split("F.Cache.clear_all()")[0])      # v1.4 live fixtures
-exec("import io as _io" + _src.split("import io as _io", 1)[1].split("CALLS.clear()\nbq_")[0])  # back-test fixtures
-import tkinter as tk
-import webbrowser
-opened = []
-webbrowser.open = lambda url, *a, **k: opened.append(url)
+exec(_src.split("# 1. Market-wide default")[0])                                           # fixtures + mocked SEC
+for marker, end in (("HIST = 424242", "CALLS.clear()"), ("SIG = 777001", "F.Cache.clear_all()"),
+                    ("ERN = 888101", "F.Cache.clear_all()"), ("SLC = 555777", "F.Cache.clear_all()")):
+    exec(marker + _src.split(marker, 1)[1].split(end)[0])
+exec("import io as _io" + _src.split("import io as _io", 1)[1].split("CALLS.clear()\nbq_")[0])  # back-test data
+
+import tkinter as tk  # noqa: E402
+import webbrowser  # noqa: E402
+webbrowser.open = lambda url, *a, **k: None
 _orig = F.SecClient.get
-F.SecClient.get = lambda self, url, retries=4: (time.sleep(0.15), _orig(self, url, retries))[1]
+F.SecClient.get = lambda self, url, retries=4: (time.sleep(0.02), _orig(self, url, retries))[1]
 orig_mainloop = tk.Tk.mainloop
+log = []
+
 
 def shot(name):
     subprocess.run(["import", "-window", "root", os.path.join(OUT, name + ".png")])
 
+
 def mainloop(self, n=0):
     import gc
+
+    def app_obj():
+        return next(o for o in gc.get_objects() if type(o).__name__ == "App")
+
     def go():
-        app = next(o for o in gc.get_objects() if type(o).__name__ == "App")
+        app = app_obj()
+        self.state("normal")
+        self.geometry("1900x980+0+0")
         app.ua_var.set("Jane Doe jane@example.com")
         app.apply_preset()
-        print("PRESET:", app.status_var.get())
-        app.min_var.set("0"); app.code_vars["S"].set(True)
-        app.tickers_var.set("ERNC, SIGL, HIST, NVDA, MSFT")
-        app.cluster_only_var.set(False); app.min_stake_var.set("0"); app.excl_plan_var.set(False)
-        app.hide_routine_var.set(False); app.hide_sold_var.set(False)
-        self.state("normal"); self.geometry("1900x950+0+0")
-        app._view_changed()
+        app.min_var.set("0")
+        app.code_vars["S"].set(True)
+        app.tickers_var.set("SELC, ERNC, SIGL, HIST, NVDA, MSFT")
+        for v in (app.cluster_only_var, app.hide_routine_var, app.hide_sold_var, app.excl_plan_var):
+            v.set(False)
+        app.min_stake_var.set("0")
+        app.view_var.set("all")
         app.start_scan()
-        self.after(18000, lambda: step2(app))
-    def step2(app):
-        app.sort_by("score"); app.sort_by("score") if not app.sort_desc else None
-        self.update(); shot("1_all_rows")
-        print("SCORES:", [(app.rows[i]["ticker"], app.rows[i]["insider"][:14], app.rows[i].get("score")) for i in app.tree.get_children()])
-        app.tree.selection_set(app.tree.get_children()[0])
-        r0 = app.rows[app.tree.get_children()[0]]
-        print("WHY TOP:", r0["score"], r0["score_why"][:4])
-        tr = None
-        import gc as _gc
-        app.show_track_record()
-        self.after(2500, lambda: (self.update(), shot("4_track_record"),
-                                  print("TRACK:", [w for w in _gc.get_objects() if type(w).__name__ == "TrackRecordWindow"][0].summary.get())))
-        print("PATTERNS:", sorted((r["insider"], r["pattern"], r["sold"]) for r in app.rows.values() if r["code"] == "P"))
-        print("ALL:", app.summary_var.get())
-        app.hide_routine_var.set(True); app.hide_sold_var.set(True); app._view_changed()
-        self.after(3500, lambda: step2b(app))
-    def step2b(app):
-        self.update(); shot("1b_hide_routine_sold")
-        print("HIDE ROUTINE+SOLD:", sorted(app.rows[i]["insider"] for i in app.tree.get_children()))
-        app.hide_routine_var.set(False); app.hide_sold_var.set(False)
-        app.excl_plan_var.set(True); app.cluster_only_var.set(True); app._view_changed()
-        self.after(400, lambda: step3(app))
-    def step3(app):
-        self.update(); shot("2_clusters_only")
-        vis = [app.rows[i] for i in app.tree.get_children()]
-        print("CLUSTERS-ONLY:", [(r["ticker"], r["insider"], r["cluster"], r["plan"]) for r in vis])
-        app.cluster_only_var.set(False); app.min_stake_var.set("20"); app._view_changed()
-        self.after(400, lambda: step4(app))
-    def step_bt(app):
+        wait_scan(app)
+
+    def wait_scan(app):
+        if str(app.start_btn.cget("state")) == "disabled":
+            self.after(400, lambda: wait_scan(app))
+            return
+        self.after(500, lambda: views(app))
+
+    def views(app):
+        app.toggle_settings()
+        app.view_var.set("all"); app._view_mode_changed(); self.update(); shot("1_light_all")
+        res = {}
+        for key, _ in F.VIEWS if hasattr(F, "VIEWS") else []:
+            pass
+        for key in ("top_buys", "top_sells", "clusters", "company", "insider", "largest"):
+            app.view_var.set(key); app._view_mode_changed(); self.update()
+            res[key] = (len(app._groups), len(app._displayed()))
+            if key in ("top_sells", "clusters", "insider"):
+                shot(f"2_view_{key}")
+        print("VIEWS:", res)
+        app.view_var.set("clusters"); app._view_mode_changed()
+        g = app._groups[0] if app._groups else None
+        if g:
+            app.tree.selection_set(g)
+            print("GROUP SEL ROWS:", len(app._sel()), "GROUP VALUES:", app.tree.item(g, "values")[:8])
+        app.search_var.set("sell co"); app._apply_view(); self.update()
+        print("SEARCH 'sell co':", len(app._displayed()))
+        app.search_var.set("")
+        print("CARDS:", {k: (c["value"].cget("text"), c["detail"].cget("text")) for k, c in app._cards_w.items()})
+        app.view_var.set("top_sells"); app._view_mode_changed()
+        top = app._displayed()[0]
+        app.tree.selection_set(top)
+        r = app.rows[top]
+        print("TOP SELL:", r["ticker"], r["insider"], r["score"], r["score_why"][:3])
+        themes(app, ["Dark", "Midnight Blue", "Sepia (warm)"])
+
+    def themes(app, names):
+        if not names:
+            app.set_theme("Dark")
+            app.view_var.set("company"); app._view_mode_changed()
+            app.show_track_record()
+            self.after(2500, lambda: (self.update(), shot("4_dark_track_record"), backtest(app)))
+            return
+        name = names.pop(0)
+        app.view_var.set("all" if name != "Midnight Blue" else "top_buys"); app._view_mode_changed()
+        app.set_theme(name)
+        self.update()
+        shot("3_theme_" + name.split()[0].lower())
+        self.after(300, lambda: themes(app, names))
+
+    def backtest(app):
         app.show_backtest()
         bw = app._bt_win
         bw.start_var.set("2025Q1"); bw.end_var.set("2025Q2"); bw.warm_var.set(2)
-        bw.min_var.set("50000"); bw.max_var.set("0")
+        bw.min_var.set("5000"); bw.max_var.set("0"); bw.side_var.set("S")
         bw.run()
+
         def wait():
             if bw.result is None and str(bw.run_btn.cget("state")) == "disabled":
-                self.after(500, wait)
+                self.after(400, wait)
                 return
-            self.update(); shot("5_backtest_bands")
-            print("BT STATUS:", bw.status.get())
-            print("BT SUMMARY:", bw.summary.get())
-            nb = bw.t_factors.master.master
-            nb.select(1); self.update(); shot("6_backtest_factors")
-            nb.select(2); self.update(); shot("7_backtest_test")
+            self.update(); shot("5_dark_backtest_sells")
+            print("BT:", bw.status.get())
+            print("BT SUMMARY:", bw.summary.get()[:160])
             self.after(300, self.destroy)
-        self.after(1000, wait)
+        self.after(800, wait)
 
-    def step4(app):
-        vis = [app.rows[i] for i in app.tree.get_children()]
-        print("STAKE>=20:", sorted((r["ticker"], F.fmt_stake(r["stake"])) for r in vis))
-        app.sort_by("stake")
-        print("SORT STAKE:", [F.fmt_stake(app.rows[i]["stake"]) for i in app.tree.get_children()])
-        iid = app.tree.get_children()[0]; app.tree.selection_set(iid); app.filter_to_ticker()
-        print("ONE TICKER:", {app.rows[i]["ticker"] for i in app.tree.get_children()}, app.summary_var.get())
-        app.clear_ticker_filter(); app.min_stake_var.set("0"); app._view_changed()
-        self.after(300, lambda: step_bt(app))
     self.after(800, go)
     orig_mainloop(self, n)
+
 
 tk.Tk.mainloop = mainloop
 F.run_gui()

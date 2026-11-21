@@ -22,6 +22,7 @@ def last_weekday(offset):
 
 
 D1, D2 = last_weekday(2), last_weekday(5)
+LASTWD = last_weekday(0)          # most recent weekday: its daily index "isn't published yet" in the mocks
 
 
 def form4(acc, cik, name, ticker, owners, txns, filed, schema="X0508", fn="wk-form4_1.xml", plan=False):
@@ -87,6 +88,7 @@ def form4(acc, cik, name, ticker, owners, txns, filed, schema="X0508", fn="wk-fo
     <footnote id="F2">The sales reported were effected pursuant to a Rule 10b5-1 trading plan adopted by the reporting person on May 1, 2026.</footnote>
     <footnote id="F3">These shares were not purchased pursuant to a Rule 10b5-1 trading plan.</footnote>
     <footnote id="F4">Purchased in the Issuer's underwritten public offering at the public offering price.</footnote>
+    <footnote id="F5">Shares sold to cover tax withholding obligations in connection with the vesting of restricted stock units.</footnote>
   </footnotes>
 </ownershipDocument>"""
     return f"""<SEC-DOCUMENT>{acc}.txt : {filed:%Y%m%d}
@@ -205,21 +207,21 @@ RESP[f"{F.SEC_WWW}/Archives/edgar/data/1067983/0000315090-26-000606.txt"] = RESP
 TODAY_ACC = "0000555555-26-000808"
 RESP[f"{F.SEC_WWW}/Archives/edgar/data/555555/{TODAY_ACC}.txt"] = form4(
     TODAY_ACC, 555555, "Fresh Co", "FRSH",
-    [{"name": "Doe John", "off": "1", "title": "President and CEO"}], [("P", 10000, 20.0, "A")], TODAY)
+    [{"name": "Doe John", "off": "1", "title": "President and CEO"}], [("P", 10000, 20.0, "A")], LASTWD)
 ATOM = f"""<?xml version="1.0" encoding="ISO-8859-1" ?>
 <feed xmlns="http://www.w3.org/2005/Atom">
 <title>Latest Filings</title>
 <entry>
 <title>4 - Fresh Co (0000555555) (Issuer)</title>
 <link rel="alternate" type="text/html" href="https://www.sec.gov/Archives/edgar/data/555555/{TODAY_ACC.replace('-', '')}/{TODAY_ACC}-index.htm"/>
-<summary type="html"> &lt;b&gt;Filed:&lt;/b&gt; {TODAY} </summary>
-<updated>{TODAY}T16:05:11-05:00</updated>
+<summary type="html"> &lt;b&gt;Filed:&lt;/b&gt; {LASTWD} </summary>
+<updated>{LASTWD}T16:05:11-05:00</updated>
 <category scheme="https://www.sec.gov/" label="form type" term="4"/>
 </entry>
 <entry>
 <title>4 - Doe John (0000777777) (Reporting)</title>
 <link rel="alternate" type="text/html" href="https://www.sec.gov/Archives/edgar/data/777777/{TODAY_ACC.replace('-', '')}/{TODAY_ACC}-index.htm"/>
-<updated>{TODAY}T16:05:11-05:00</updated>
+<updated>{LASTWD}T16:05:11-05:00</updated>
 </entry>
 <entry>
 <title>424B2 - Bank Notes (0000123) (Filer)</title>
@@ -309,7 +311,7 @@ tb = next(r for r in rows if r["ticker"] == "TBIO")
 check("missing price treated as 0", abs(tb["value"] - 250000) < 0.01)
 check("joint filers combined", tb["insider"] == "Big Fund LP; Big Fund GP LLC")
 check("rendered link", rows[0]["link"].startswith("https://www.sec.gov/Archives/edgar/data/") and "/xslF345X05/wk-form4_1.xml" in rows[0]["link"])
-check("feed picked up today's filing", any(r["ticker"] == "FRSH" and r["filing_date"] == str(TODAY) for r in rows))
+check("feed picked up the not-yet-indexed day's filing", any(r["ticker"] == "FRSH" and r["filing_date"] == str(LASTWD) for r in rows))
 
 # 2. Cached re-scan: no Archives fetches for filings
 CALLS.clear()
@@ -938,6 +940,15 @@ BQ["2025q1"].filing(bacc(), 900005, "T005", ("Late Larry", "80005"), "Director",
                     [("P", 10000, 10.0, dt.date(2025, 1, 17), 10000)], dt.date(2025, 2, 28))
 EXPECT["signals"] += 1
 
+# sales for the Sell Score back-test: big sales (60% of holding) precede a 20% drop, small ones don't
+for i in range(40):
+    q_ = "2025q1" if i < 20 else "2025q2"
+    base = dt.date(2025, 1, 6) if i < 20 else dt.date(2025, 4, 7)
+    d = base + dt.timedelta(days=(i % 20) * 2)
+    big = i % 2 == 0
+    BQ[q_].filing(bacc(), 900200 + i, f"T{200 + i}", (f"Seller{i} Gamma", f"{70100 + i}"), "Officer", "CEO",
+                  [("S", 30000 if big else 1000, 10.0, d, 20000 if big else 49000)], d)
+
 for q_, bq in BQ.items():
     url = F.BULK_URLS[0 if q_ >= "2025q1" else 1].format(q=q_)      # older quarters only at the second address
     RESP[url] = bq.zip()
@@ -953,6 +964,11 @@ for i in range(0, 60, 2):
     base = dt.date(2025, 1, 6) if i < 30 else dt.date(2025, 4, 7)
     jump = base + dt.timedelta(days=(i % 30) * 2 + 20)
     RESP[YURL.format(tic)] = yjson(series(lambda d, j=jump: 12.0 if d >= j else 10.0, days=700), vol=100_000)
+for i in range(40):
+    base = dt.date(2025, 1, 6) if i < 20 else dt.date(2025, 4, 7)
+    drop = base + dt.timedelta(days=(i % 20) * 2 + 20)
+    RESP[YURL.format(f"T{200 + i}")] = yjson(series(lambda d, j=drop, big=(i % 2 == 0): 8.0 if (big and d >= j) else 10.0,
+                                                    days=700), vol=100_000)
 for per in {F.frame_period_instant(dt.date(2025, m, 15)) for m in range(1, 13)}:
     RESP[f"{F.SEC_DATA}/api/xbrl/frames/dei/EntityCommonStockSharesOutstanding/shares/{per}.json"] = json.dumps(
         {"data": [{"cik": 900000 + i, "val": 1_000_000} for i in range(103)]}).encode()
@@ -1006,7 +1022,125 @@ check("quarter helpers", (F.shift_quarter("2025q1", -2), F.quarter_range("2024q4
       ("2024q3", ["2024q4", "2025q1", "2025q2"], dt.date(2024, 12, 31), "2024-01-05"))
 check("default back-test period", F.default_backtest_quarters(dt.date(2026, 11, 20)) == ("2025q2", "2026q1"))
 
-# 13. Cancel
+# 13. v1.5 Sell Score: live scan of company SELC + back-test of sales
+SLC = 555777
+L_FIL = {}
+_l = [0]
+
+
+def add_sl(owner, txns, d, plan=False):
+    _l[0] += 1
+    a = f"{SLC:010d}-26-{_l[0]:06d}"
+    L_FIL[a] = (owner, txns, d, plan)
+    return a
+
+
+F5N = '<footnoteId id="F5"/>'
+SAM = {"name": "Ceo Sam", "off": "1", "title": "Chief Executive Officer", "cik": "8001"}
+RIT = {"name": "Dir Rita", "dir": "1", "cik": "8002"}
+TAX = {"name": "Cfo Tax", "off": "1", "title": "CFO", "cik": "8003"}
+EXE = {"name": "Exer Ed", "off": "1", "title": "COO", "cik": "8004"}
+PAT = {"name": "Plan Pat", "off": "1", "title": "President", "cik": "8005"}
+for k in (1, 2, 3):
+    add_sl(RIT, [("S", 5000, 30.0, "D", 100000 + 5000 * (4 - k))], F._years_ago(D2, k) + dt.timedelta(days=3))
+SAM_ACC = add_sl(SAM, [("S", 60000, 50.0, "D", 40000)], D2)
+add_sl(RIT, [("S", 10000, 50.0, "D", 90000)], D2)
+add_sl(TAX, [("S", 20000, 50.0, "D", 10000, F5N)], D2)
+add_sl(EXE, [("M", 30000, 10.0, "A", 30000), ("S", 30000, 50.0, "D", 0)], D2)
+add_sl(PAT, [("S", 8000, 50.0, "D", 2000)], D2, plan=True)
+for a_, (owner, txns, d, plan) in L_FIL.items():
+    RESP[f"{F.SEC_WWW}/Archives/edgar/data/{SLC}/{a_}.txt"] = form4(a_, SLC, "Sell Co", "SELC", [owner], txns, d, plan=plan)
+
+
+def sl_subs(accs):
+    accs = sorted(accs, key=lambda a: L_FIL[a][2], reverse=True)
+    return json.dumps({"filings": {"recent": {"accessionNumber": accs, "filingDate": [str(L_FIL[a][2]) for a in accs],
+                                              "form": ["4"] * len(accs), "primaryDocument": ["x"] * len(accs)},
+                                   "files": []}}).encode()
+
+
+RESP[f"{F.SEC_DATA}/submissions/CIK{SLC:010d}.json"] = sl_subs(list(L_FIL))
+for o in (SAM, RIT, TAX, EXE, PAT):
+    RESP[f"{F.SEC_DATA}/submissions/CIK{int(o['cik']):010d}.json"] = sl_subs([a_ for a_, v in L_FIL.items() if v[0] is o])
+RESP[YURL.format("SELC")] = yjson(series(lambda d: 30.0 if d < D2 - dt.timedelta(days=85) else 50.0), vol=500_000)
+tk2 = json.loads(RESP[f"{F.SEC_WWW}/files/company_tickers.json"])
+tk2["12"] = {"cik_str": SLC, "ticker": "SELC", "title": "Sell Co"}
+RESP[f"{F.SEC_WWW}/files/company_tickers.json"] = json.dumps(tk2).encode()
+F.Cache.clear_all()
+
+CALLS.clear()
+q = queue.Queue()
+F.Scanner(P(tickers=["SELC"], codes={"S"}, min_value=0), q, threading.Event()).run()
+lrows, linfo, lclu = [], {}, {}
+while not q.empty():
+    _, kind, payload = q.get()
+    if kind == "rows":
+        lrows.extend(payload)
+    elif kind in ("history", "context"):
+        for k_, info in payload.items():
+            linfo.setdefault(k_, {}).update(info)
+    elif kind == "clusters":
+        lclu.update(payload)
+for r in lrows:
+    r.update(linfo.get(r["hkey"], {}))
+F.apply_signal_filters(lrows, lclu, False, 0, 0)
+cur = {r["insider"]: r for r in lrows if r["trade_start"] == str(D2)}
+print("\n[13] sells:")
+for n_, r in sorted(cur.items(), key=lambda x: -(x[1]["score"] or 0)):
+    print(f"   {n_:<10} score={r['score']:<3} stake={F.fmt_stake(r['stake']):>7} deep={r['deep']} pattern={r.get('pattern')!s:<34}"
+          f" flags={'expl ' if r['explained'] else ''}{'ex&sell ' if r['exercise_sell'] else ''}{'plan' if r['plan'] else ''}")
+SA = cur["Ceo Sam"]
+print("   " + "\n   ".join(SA["score_why"]))
+check("sale rows keyed separately (hkey)", SA["hkey"] == f"{SAM_ACC}|S")
+check("big discretionary CEO sale after a run-up scores highest", SA["score"] >= 80
+      and SA["score"] == max(r["score"] for r in cur.values()))
+check("first sale in 5+ years (seller history)", SA["pattern"] == "First sale in 5+ yrs" and SA["pattern_kind"] == "first")
+check("run-up + near 52w high factors", any("run-up" in w or "3 months before the sale" in w for w in SA["score_why"])
+      and any("52-week high" in w for w in SA["score_why"]))
+check("routine yearly seller capped at 45", cur["Dir Rita"]["pattern_kind"] == "routine" and cur["Dir Rita"]["score"] <= 45)
+check("tax-withholding sale explained, capped", cur["Cfo Tax"]["explained"] and cur["Cfo Tax"]["score"] <= 45)
+check("exercise-and-sell detected, capped at 40", cur["Exer Ed"]["exercise_sell"] and cur["Exer Ed"]["score"] <= 40)
+check("10b5-1 plan sale: no deep check, capped", cur["Plan Pat"]["plan"] and not cur["Plan Pat"]["deep"]
+      and cur["Plan Pat"]["score"] <= 45)
+check("sell rows never show 'Sold Since'", all(r["sold_kind"] == "na" for r in lrows))
+check("seller history fetched for significant sales", any(f"CIK{8001:010d}" in u for u in CALLS)
+      and not any(f"CIK{8005:010d}" in u for u in CALLS))
+check("explained-sale wording", [bool(F.EXPLAINED_RE.search(t)) for t in (
+    "Shares withheld to satisfy tax withholding obligations upon vesting of RSUs.",
+    "Sale effected for estate planning purposes.", "Weighted average price; prices ranged from $50.01 to $50.40.",
+    "Shares sold to fund the purchase of a residence.")] == [True, True, False, True])
+check("sell score helpers", F.sell_score({"code": "P"})[0] is None and F.rate_row({"code": "S", "stake": -100})[0] > 30
+      and F.sell_score({"code": "S", "stake": -2.0})[0] < 30 + 8 + 1)
+log = F.SignalLog(os.path.join(_tf.mkdtemp(), "t2.sqlite3"))
+nl = log.log([SA, cur["Dir Rita"]])
+items = log.all()
+check("track record logs sales with side S", nl == 2 and all(i["side"] == "S" for i in items)
+      and items[0]["acc"].endswith("|S"))
+summ = F.track_record_summary([{"side": "S", "score": 80, "ret": -12.0, "excess": -15.0},
+                               {"side": "S", "score": 75, "ret": 5.0, "excess": 2.0},
+                               {"side": "P", "score": 90, "ret": 9.0, "excess": 3.0}], "S")
+check("sell summary counts lagging SPY as success", summ["70+"]["n"] == 2 and summ["70+"]["beat"] == 50.0)
+log.close()
+csvrow = F.row_to_csv(SA)
+check("CSV for sales", csvrow[H("Signal Score")] == SA["score"] and len(csvrow) == len(F.CSV_HEADERS))
+
+bq_ = queue.Queue()
+F.Backtester(F.BacktestParams("2025q1", "2025q2", "Test test@example.com", warmup_quarters=2, min_value=5_000,
+                              max_signals=0, company_data=True, side="S"), bq_, threading.Event()).run()
+rs = next((p_ for _, k, p_ in list(bq_.queue) if k == "bt_done"), None)
+err = next((p_ for _, k, p_ in list(bq_.queue) if k == "error"), None)
+print("   sell back-test:", err or {b: (v["n"], None if v["ex6M"] is None else round(v["ex6M"], 1), v["hit6"])
+                                   for b, v in rs["bands"].items()})
+check("sell back-test ran", rs is not None and rs["params"]["side"] == "S" and rs["signals"] >= 40)
+big = next(f for f in rs["factors"] if f["key"] == "s_pct50")
+check("big-sale factor: -20% vs SPY difference", abs(big["uplift"] - (-20.0)) < 1.0)
+check("sell bands: high scores lagged SPY", rs["bands"]["70+"]["ex6M"] is not None and rs["bands"]["70+"]["ex6M"] < -15
+      and rs["bands"]["70+"]["hit6"] == 100.0)
+check("sell suggestion flips sign (worse return -> more points)",
+      F.factor_stats([{"ex6M": -20.0, "factors": ["s_pct50"]}] * 30 + [{"ex6M": 0.0, "factors": []}] * 30,
+                     side="S")[0]["suggested"] == 20)
+
+# 14. Cancel
 q = queue.Queue(); ev = threading.Event(); ev.set()
 F.Scanner(P(), q, ev).run()
 kinds = [k for _, k, _ in list(q.queue)]
