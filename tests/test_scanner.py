@@ -1152,6 +1152,10 @@ check("sign-in: email in name box rejected", F.identity_problem("pat@gmail.com",
 check("sign-in: User-Agent is 'Name email'", F.sec_user_agent("  Pat   Smith ", " pat@gmail.com ") == "Pat Smith pat@gmail.com")
 check("sign-in: accents folded for the HTTP header", F.sec_user_agent("Zoë Łukasz", "z@gmail.com").isascii()
       and F.valid_user_agent(F.sec_user_agent("Zoë Łukasz", "z@gmail.com")))
+F.save_identity("  Pat   Smith ", " pat@gmail.com ")
+check("sign-in: last entry remembered for next launch", F.load_identity() == ("Pat Smith", "pat@gmail.com"))
+check("sign-in: remembered in its own file, not settings", "user_agent" not in F.load_settings()
+      and os.path.basename(F.identity_path()) == "identity.json")
 
 # 14. Cancel
 q = queue.Queue(); ev = threading.Event(); ev.set()
