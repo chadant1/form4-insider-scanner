@@ -40,7 +40,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 APP_NAME = "SEC Form 4 Insider Scanner"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 
 SEC_WWW = "https://www.sec.gov"
 SEC_DATA = "https://data.sec.gov"
@@ -2173,6 +2173,29 @@ def identity_problem(name: str, email: str) -> str:
     return ""
 
 
+def identity_path() -> str:
+    return os.path.join(app_data_dir(), "identity.json")
+
+
+def load_identity() -> tuple[str, str]:
+    """The name and email last used on this computer by this Windows account (stored only in its own
+    %LOCALAPPDATA% folder, so copies of the app given to other people never contain them)."""
+    try:
+        with open(identity_path(), "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        return str(d.get("name", "")), str(d.get("email", ""))
+    except Exception:
+        return "", ""
+
+
+def save_identity(name: str, email: str) -> None:
+    try:
+        with open(identity_path(), "w", encoding="utf-8") as fh:
+            json.dump({"name": " ".join((name or "").split()), "email": (email or "").strip()}, fh, indent=2)
+    except Exception:
+        pass
+
+
 def sec_user_agent(name: str, email: str) -> str:
     """'Name email' for the SEC User-Agent header (accents folded to plain ASCII so the header is valid)."""
     import unicodedata
@@ -2183,8 +2206,9 @@ def sec_user_agent(name: str, email: str) -> str:
 
 
 def ask_sec_identity(root, theme_name: str = "Light", parent=None):
-    """Modal sign-in window. Returns the SEC User-Agent string, or None if the person closed it.
-    Nothing typed here is saved: everyone enters their own name and email each time the app opens."""
+    """Modal sign-in window shown every time the app opens. Returns the SEC User-Agent string, or None if
+    the person closed it. The boxes are filled in with the last name/email used by this Windows account,
+    so a returning user just clicks Continue; anyone else clicks "Not you?" and types their own."""
     import tkinter as tk
     T = THEMES.get(theme_name) or THEMES["Light"]
     win = tk.Toplevel(parent or root)
@@ -2209,12 +2233,14 @@ def ask_sec_identity(root, theme_name: str = "Light", parent=None):
     body = tk.Frame(win, bg=T["bg"], padx=22, pady=16)
     body.pack(fill="both", expand=True)
     body.columnconfigure(1, weight=1)
+    last_name, last_email = load_identity()
     tk.Label(body, text=("The SEC requires everyone who downloads EDGAR data with a program to identify "
                          "themselves. Enter your own name and email. They are sent only to sec.gov with "
-                         "each request, and are not saved: you enter them each time the app opens."),
+                         "each request, and remembered only on this computer for your Windows account, "
+                         "so next time you can just click Continue."),
              wraplength=460, justify="left", bg=T["bg"], fg=T["muted"], font=font
              ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
-    name_v, email_v, err_v = tk.StringVar(), tk.StringVar(), tk.StringVar()
+    name_v, email_v, err_v = tk.StringVar(value=last_name), tk.StringVar(value=last_email), tk.StringVar()
 
     def field(row, label, var):
         tk.Label(body, text=label, bg=T["bg"], fg=T["fg"], font=bold).grid(row=row, column=0, sticky="w",
@@ -2238,7 +2264,14 @@ def ask_sec_identity(root, theme_name: str = "Light", parent=None):
             err_v.set(problem)
             return
         result["ua"] = sec_user_agent(name_v.get(), email_v.get())
+        save_identity(name_v.get(), email_v.get())
         win.destroy()
+
+    def not_me(*_):
+        name_v.set("")
+        email_v.set("")
+        err_v.set("")
+        name_e.focus_set()
 
     def cancel(*_):
         win.destroy()
@@ -2252,8 +2285,13 @@ def ask_sec_identity(root, theme_name: str = "Light", parent=None):
         b.pack(side="left", padx=(8, 0))
         return b
 
+    if last_name or last_email:
+        nm = tk.Label(btns, text="Not you?", font=(fam, 10, "underline"), bg=T["bg"], fg=T["accent"],
+                      cursor="hand2")
+        nm.pack(side="left", padx=(0, 18))
+        nm.bind("<Button-1>", not_me)
     button("Exit" if parent is None else "Cancel", cancel, False)
-    button("Continue", ok, True)
+    cont = button("Continue", ok, True)
     win.protocol("WM_DELETE_WINDOW", cancel)
     win.bind("<Return>", ok)
     win.bind("<Escape>", cancel)
@@ -2285,7 +2323,7 @@ def ask_sec_identity(root, theme_name: str = "Light", parent=None):
     except Exception:
         pass
     win.focus_force()
-    name_e.focus_set()
+    (cont if (last_name and last_email) else name_e).focus_set()
     win.wait_window()
     return result["ua"]
 
@@ -3483,7 +3521,7 @@ def run_gui() -> None:
             self.ua_var = tk.StringVar(value=self.session_ua)
             ttk.Label(f, textvariable=self.ua_var, font=self.bold_font).pack(side="left", padx=6)
             ttk.Button(f, text="Switch user...", command=self.switch_user).pack(side="left", padx=6)
-            ttk.Label(f, text="Not saved: everyone enters their own name and email each time the app opens.",
+            ttk.Label(f, text="Asked each time the app opens; remembered only for this Windows account.",
                       style="Hint.TLabel").pack(side="left", padx=(6, 0))
 
             # Action row -----------------------------------------------------
