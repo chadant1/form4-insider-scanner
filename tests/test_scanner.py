@@ -1157,6 +1157,24 @@ check("sign-in: last entry remembered for next launch", F.load_identity() == ("P
 check("sign-in: remembered in its own file, not settings", "user_agent" not in F.load_settings()
       and os.path.basename(F.identity_path()) == "identity.json")
 
+# 14c. Phone page (cloud/publish_site.py): same presets as the desktop app
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cloud"))
+import publish_site as PS  # noqa: E402
+_rows, _cl, _st = F.collect_scan(P(tickers=["SELC"], codes={"P", "S"}, min_value=0))
+_data = PS.build_data(_rows, _cl, TODAY, dt.datetime.now(dt.timezone.utc), _st)
+_by = {r["id"]: r for r in _data["rows"]}
+check("phone page: selling preset keeps only the discretionary CEO sale",
+      [_by[i]["insider"] for i in _data["sells"]] == ["Ceo Sam"] and _by[_data["sells"][0]]["score"] == 92)
+check("phone page: score reasons and SEC link included", _by[_data["sells"][0]]["why"]
+      and _by[_data["sells"][0]]["link"].startswith("https://www.sec.gov/"))
+check("phone page: data is plain JSON", json.loads(json.dumps(_data))["end"] == TODAY.isoformat())
+os.environ.pop("SEC_CONTACT", None)
+try:
+    PS.contact_from_env()
+    check("phone page: refuses to run without the SEC contact secret", False)
+except SystemExit as e_:
+    check("phone page: refuses to run without the SEC contact secret", "SEC_CONTACT" in str(e_))
+
 # 14. Cancel
 q = queue.Queue(); ev = threading.Event(); ev.set()
 F.Scanner(P(), q, ev).run()
