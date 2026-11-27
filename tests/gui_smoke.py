@@ -36,7 +36,7 @@ def mainloop(self, n=0):
         app = app_obj()
         self.state("normal")
         self.geometry("1900x980+0+0")
-        app.ua_var.set("Jane Doe jane@example.com")
+        print("SIGNED IN AS:", app.ua_var.get())
         app.apply_preset()
         app.min_var.set("0")
         app.code_vars["S"].set(True)
@@ -118,4 +118,8 @@ def mainloop(self, n=0):
 
 
 tk.Tk.mainloop = mainloop
+# An older version saved the owner's contact; the app must ignore it and use this session's sign-in.
+F.save_settings({**F.load_settings(), "user_agent": "Owner owner@gmail.com"})
+F.ask_sec_identity = lambda *a, **k: "Jane Doe jane@example.com"
 F.run_gui()
+print("SAVED CONTACT AFTER CLOSE:", F.load_settings().get("user_agent"))

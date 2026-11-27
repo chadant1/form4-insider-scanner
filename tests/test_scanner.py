@@ -1140,6 +1140,19 @@ check("sell suggestion flips sign (worse return -> more points)",
       F.factor_stats([{"ex6M": -20.0, "factors": ["s_pct50"]}] * 30 + [{"ex6M": 0.0, "factors": []}] * 30,
                      side="S")[0]["suggested"] == 20)
 
+# 14b. Sign-in (each user's own name and email)
+check("sign-in: real name + email accepted", F.identity_problem("Pat Smith", "pat.smith@gmail.com") == "")
+check("sign-in: blank name rejected", F.identity_problem("", "pat@gmail.com") != "")
+check("sign-in: blank email rejected", F.identity_problem("Pat Smith", "") != "")
+check("sign-in: bad email rejected", F.identity_problem("Pat Smith", "pat@gmail") != ""
+      and F.identity_problem("Pat Smith", "pat smith@gmail.com") != "")
+check("sign-in: example placeholders rejected", F.identity_problem("Jane Doe", "jd@gmail.com") != ""
+      and F.identity_problem("Pat Smith", "jane@example.com") != "")
+check("sign-in: email in name box rejected", F.identity_problem("pat@gmail.com", "pat@gmail.com") != "")
+check("sign-in: User-Agent is 'Name email'", F.sec_user_agent("  Pat   Smith ", " pat@gmail.com ") == "Pat Smith pat@gmail.com")
+check("sign-in: accents folded for the HTTP header", F.sec_user_agent("Zoë Łukasz", "z@gmail.com").isascii()
+      and F.valid_user_agent(F.sec_user_agent("Zoë Łukasz", "z@gmail.com")))
+
 # 14. Cancel
 q = queue.Queue(); ev = threading.Event(); ev.set()
 F.Scanner(P(), q, ev).run()
