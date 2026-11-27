@@ -5090,6 +5090,51 @@ def apply_signal_filters(rows: list, clusters: dict, exclude_plan: bool, min_clu
     return out
 
 
+def collect_scan(params: ScanParams, log=None, cancel: threading.Event | None = None) -> tuple[list, dict, dict]:
+    """Run a scan to the end without the GUI. Returns (rows, clusters, summary) with history, prices,
+    company data and duplicate flags merged into the rows. Raises RuntimeError if the scan fails."""
+    q: queue.Queue = queue.Queue()
+    cancel = cancel or threading.Event()
+    t = threading.Thread(target=Scanner(params, q, cancel).run, daemon=True)
+    t.start()
+    rows, clusters, extra, dups, summary, last = [], {}, {}, {}, {}, 0.0
+    while True:
+        try:
+            _sid, kind, payload = q.get(timeout=0.5)
+        except queue.Empty:
+            if not t.is_alive():
+                break
+            continue
+        if kind == "rows":
+            rows.extend(payload)
+        elif kind == "clusters":
+            clusters.update(payload)
+        elif kind in ("history", "context"):
+            for key, info in payload.items():
+                extra.setdefault(key, {}).update(info)
+        elif kind == "dups":
+            dups.update(payload)
+        elif kind in ("phase", "warn") and log:
+            log(f"[{kind}] {payload}")
+        elif kind == "progress" and log and time.time() - last > 15:
+            last = time.time()
+            log(f"  scanned {payload['done']:,}/{payload['total']:,} filings, {payload['matched']:,} matches")
+        elif kind == "done":
+            summary = payload if isinstance(payload, dict) else {"text": str(payload)}
+            break
+        elif kind == "cancelled":
+            raise RuntimeError("scan cancelled")
+        elif kind == "error":
+            raise RuntimeError(str(payload))
+    for r in rows:
+        key = r.get("hkey", r["acc"])
+        if key in extra:
+            r.update(extra[key])
+        if r["acc"] in dups:
+            r["dup_of"] = dups[r["acc"]]
+    return rows, clusters, summary
+
+
 def run_backtest_cli(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="form4_scanner.py --backtest", description="Back-test the Signal Score.")
     ap.add_argument("start", help="first quarter, e.g. 2025Q2")

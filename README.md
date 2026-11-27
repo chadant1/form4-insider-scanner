@@ -156,6 +156,18 @@ Offering sales are capped at 30. Exercise-and-sell is capped at 40. Plan, explai
 
 This is a research filter, not investment advice. Insider buying has historically been followed by modestly positive returns *on average*, and plenty of individual cases lose money.
 
+## Phone page (nightly scan)
+Every weekday evening a GitHub workflow scans the last 30 days of Form 4 filings market-wide and publishes the results to a phone-friendly page at **https://chadant1.github.io/form4-insider-scanner/**. Open it on your phone and use *Add to Home Screen* (Safari's Share menu on iPhone, the ⋮ menu in Chrome on Android) to get an app icon.
+
+* **Buys:** the Insider Buying preset, ranked by Signal Score.
+* **Sells:** the Insider Selling preset, ranked by Sell Score.
+* **Clusters:** those buys grouped by company.
+* **This week:** the insiders who bought or sold the most in the last 7 days, excluding 10b5-1 plans, offerings and funds.
+
+Tap a trade to see why it scored that way, its price context and a link to the SEC filing. Light and dark themes follow your phone; the button at the top switches them. The last scan stays readable offline.
+
+Setup (once): in the repo's *Settings → Secrets and variables → Actions*, add a secret named `SEC_CONTACT` with your name and email (for example `Pat Smith pat@gmail.com`); the SEC requires it, and it never appears on the page. In *Settings → Pages*, set *Source* to *GitHub Actions*. The scan runs at about 9:45 PM Central; to run it now, open *Actions → Nightly insider scan → Run workflow*. The first run downloads tens of thousands of filings and can take an hour or more; later runs reuse that download and take minutes. GitHub pauses scheduled workflows in repos with no commits for 60 days; it emails you, and one click re-enables it.
+
 ## Other features
 * Filters for date range (7 / 14 / 30 days or custom), ticker watchlist or market-wide, role (CEO, CFO, Legal / General Counsel, Director / 10% Owner), transaction codes (P, S, A, M), minimum $ value, and 4/A amendments.
 * Scans run in the background with a live progress bar and Cancel button.
@@ -180,6 +192,9 @@ form4_scanner.py                  the app (GUI + scanner + CLI)
 assets/app.ico, app.png           icon
 installer/Form4Scanner.iss        Inno Setup installer script
 .github/workflows/build-windows.yml  CI: tests → exe → installer → release
+.github/workflows/daily-scan.yml     nightly scan → phone page on GitHub Pages
+cloud/publish_site.py             runs the nightly scan and writes the page's data.json
+cloud/site/                       the phone page (HTML, icons, offline support)
 tests/test_scanner.py             offline end-to-end tests
 tests/gui_smoke.py                manual GUI smoke test (Linux/Xvfb)
 ```
