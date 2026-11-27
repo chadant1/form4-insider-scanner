@@ -5119,6 +5119,10 @@ def collect_scan(params: ScanParams, log=None, cancel: threading.Event | None = 
         elif kind == "progress" and log and time.time() - last > 15:
             last = time.time()
             log(f"  scanned {payload['done']:,}/{payload['total']:,} filings, {payload['matched']:,} matches")
+        elif kind in ("history_progress", "context_progress") and log and time.time() - last > 30:
+            last = time.time()
+            what = "insiders" if kind == "history_progress" else "companies"
+            log(f"  checked {payload[0]:,}/{payload[1]:,} {what}")
         elif kind == "done":
             summary = payload if isinstance(payload, dict) else {"text": str(payload)}
             break
