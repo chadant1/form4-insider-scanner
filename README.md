@@ -10,7 +10,7 @@ A Windows desktop app that scans SEC EDGAR Form 4 filings for insider buys and s
 2. Download **`Form4Scanner-Setup.exe`** and run it. It installs to your user folder, so no admin rights are needed, and adds a Start-menu shortcut (desktop shortcut optional).
    Prefer no installer? Download **`Form4Scanner.exe`** instead and double-click it.
 3. The app isn't code-signed, so Windows SmartScreen may show "Windows protected your PC". Click **More info → Run anyway**.
-4. The first time, type your **name and email** in the *SEC contact* box, for example `Jane Doe jane@example.com`. The SEC requires this on automated requests.
+4. Each time the app opens, it asks **who is using it**: enter your own full name and email. The SEC requires every automated user to identify themselves, so each person who uses the app enters their own details. They are sent only to sec.gov and are never saved, so a copy you pass to someone else never carries your name. Example addresses (such as @example.com) are refused. To change who is signed in without restarting, use **File → Switch user** or the *Switch user...* button in the settings.
 
 Every push to `main` rebuilds the app on GitHub Actions and replaces the *latest* release.
 

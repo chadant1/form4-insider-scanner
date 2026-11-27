@@ -40,7 +40,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 APP_NAME = "SEC Form 4 Insider Scanner"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 
 SEC_WWW = "https://www.sec.gov"
 SEC_DATA = "https://data.sec.gov"
@@ -195,8 +195,8 @@ class SecClient:
                                         or b"User-Agent" in body
                                         or b"user agent" in body.lower()):
                     raise SecAccessDenied(
-                        "SEC rejected the request because of the User-Agent. Enter your real "
-                        "name and email in the 'SEC contact' box (e.g. 'Jane Doe jane@example.com')."
+                        "SEC rejected the request because of the name/email it was sent with. Use "
+                        "File > Switch user to enter your real name and email."
                     ) from None
                 if exc.code in (403, 429, 500, 502, 503, 504):
                     last_error = exc
@@ -2149,6 +2149,147 @@ def valid_user_agent(ua: str) -> bool:
     return bool(re.search(r"\S+@\S+\.\S+", ua or ""))
 
 
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+'-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$")
+PLACEHOLDER_DOMAINS = {"example.com", "example.org", "example.net", "test.com", "email.com", "domain.com"}
+PLACEHOLDER_NAMES = {"jane doe", "john doe", "test", "name", "your name", "first last", "asdf"}
+
+
+def identity_problem(name: str, email: str) -> str:
+    """Why a sign-in name/email is not acceptable to send to the SEC, or "" if it is fine."""
+    name = " ".join((name or "").split())
+    email = (email or "").strip()
+    if not name:
+        return "Enter your name."
+    if "@" in name or len(name) < 2 or not any(ch.isalpha() for ch in name):
+        return "Enter your real name (first and last name)."
+    if name.lower() in PLACEHOLDER_NAMES:
+        return "Enter your own name, not an example name."
+    if not email:
+        return "Enter your email address."
+    if not EMAIL_RE.match(email):
+        return "That email address doesn't look right. Example: jsmith@gmail.com"
+    if email.split("@", 1)[1].lower() in PLACEHOLDER_DOMAINS:
+        return "Enter your own email address, not an example address."
+    return ""
+
+
+def sec_user_agent(name: str, email: str) -> str:
+    """'Name email' for the SEC User-Agent header (accents folded to plain ASCII so the header is valid)."""
+    import unicodedata
+    name = " ".join((name or "").split())
+    ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    ascii_name = " ".join(re.sub(r"[^A-Za-z0-9 .,'-]", " ", ascii_name).split()) or "Form4Scanner user"
+    return f"{ascii_name} {(email or '').strip()}"
+
+
+def ask_sec_identity(root, theme_name: str = "Light", parent=None):
+    """Modal sign-in window. Returns the SEC User-Agent string, or None if the person closed it.
+    Nothing typed here is saved: everyone enters their own name and email each time the app opens."""
+    import tkinter as tk
+    T = THEMES.get(theme_name) or THEMES["Light"]
+    win = tk.Toplevel(parent or root)
+    win.title(f"{APP_NAME} - Sign in")
+    win.configure(bg=T["bg"])
+    win.resizable(False, False)
+    if sys.platform == "win32":
+        try:
+            ico = resource_path(os.path.join("assets", "app.ico"))
+            if os.path.exists(ico):
+                win.iconbitmap(ico)
+        except Exception:
+            pass
+    fam = "Segoe UI" if sys.platform == "win32" else "DejaVu Sans"
+    font, bold, big = (fam, 10), (fam, 10, "bold"), (fam, 15, "bold")
+    result = {"ua": None}
+
+    head = tk.Frame(win, bg=T["header"])
+    head.pack(fill="x")
+    tk.Label(head, text="Who is using the scanner?", font=big, bg=T["header"], fg=T["header_fg"],
+             anchor="w", padx=22, pady=(14)).pack(fill="x")
+    body = tk.Frame(win, bg=T["bg"], padx=22, pady=16)
+    body.pack(fill="both", expand=True)
+    body.columnconfigure(1, weight=1)
+    tk.Label(body, text=("The SEC requires everyone who downloads EDGAR data with a program to identify "
+                         "themselves. Enter your own name and email. They are sent only to sec.gov with "
+                         "each request, and are not saved: you enter them each time the app opens."),
+             wraplength=460, justify="left", bg=T["bg"], fg=T["muted"], font=font
+             ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+    name_v, email_v, err_v = tk.StringVar(), tk.StringVar(), tk.StringVar()
+
+    def field(row, label, var):
+        tk.Label(body, text=label, bg=T["bg"], fg=T["fg"], font=bold).grid(row=row, column=0, sticky="w",
+                                                                         padx=(0, 12), pady=5)
+        e = tk.Entry(body, textvariable=var, width=38, font=font, bg=T["entry"], fg=T["fg"],
+                     insertbackground=T["fg"], relief="flat", highlightthickness=1,
+                     highlightbackground=T["border"], highlightcolor=T["accent"])
+        e.grid(row=row, column=1, sticky="we", pady=5, ipady=5)
+        return e
+
+    name_e = field(1, "Full name", name_v)
+    field(2, "Email", email_v)
+    tk.Label(body, textvariable=err_v, bg=T["bg"], fg=T["bad"], font=font, anchor="w", justify="left",
+             wraplength=460).grid(row=3, column=0, columnspan=2, sticky="we", pady=(6, 0))
+    btns = tk.Frame(body, bg=T["bg"])
+    btns.grid(row=4, column=0, columnspan=2, sticky="e", pady=(12, 0))
+
+    def ok(*_):
+        problem = identity_problem(name_v.get(), email_v.get())
+        if problem:
+            err_v.set(problem)
+            return
+        result["ua"] = sec_user_agent(name_v.get(), email_v.get())
+        win.destroy()
+
+    def cancel(*_):
+        win.destroy()
+
+    def button(text, cmd, primary):
+        bg = T["accent"] if primary else T["panel"]
+        fg = T["accent_fg"] if primary else T["fg"]
+        b = tk.Button(btns, text=text, command=cmd, font=bold, bg=bg, fg=fg, activebackground=
+                      T["accent_hover"] if primary else T["border"], activeforeground=fg, relief="flat",
+                      bd=0, padx=18, pady=6, cursor="hand2", highlightthickness=0)
+        b.pack(side="left", padx=(8, 0))
+        return b
+
+    button("Exit" if parent is None else "Cancel", cancel, False)
+    button("Continue", ok, True)
+    win.protocol("WM_DELETE_WINDOW", cancel)
+    win.bind("<Return>", ok)
+    win.bind("<Escape>", cancel)
+    win.update_idletasks()
+    w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+    win.geometry(f"+{max(0, (win.winfo_screenwidth() - w) // 2)}+{max(0, (win.winfo_screenheight() - h) // 3)}")
+    if sys.platform == "win32" and T.get("dark"):
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+            val = ctypes.c_int(1)
+            for attr in (20, 19):
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val),
+                                                              ctypes.sizeof(val)) == 0:
+                    break
+        except Exception:
+            pass
+    if parent is not None:
+        win.transient(parent)
+    win.deiconify()
+    win.lift()
+    try:
+        win.attributes("-topmost", True)
+        win.after(300, lambda: win.winfo_exists() and win.attributes("-topmost", False))
+    except Exception:
+        pass
+    try:
+        win.grab_set()
+    except Exception:
+        pass
+    win.focus_force()
+    name_e.focus_set()
+    win.wait_window()
+    return result["ua"]
+
+
 def fmt_money(v: float, decimals: int = 0) -> str:
     return f"${v:,.{decimals}f}"
 
@@ -2865,9 +3006,11 @@ def run_gui() -> None:
     PATTERN_ORDER = {"first": 0, "opp": 1, "regular": 2, "routine": 3, "unknown": 4, "pending": 5, "na": 6}
 
     class App:
-        def __init__(self, root: tk.Tk):
+        def __init__(self, root: tk.Tk, user_agent: str = ""):
             self.root = root
             self.settings = load_settings()
+            self.settings.pop("user_agent", None)     # never kept: each person signs in when the app opens
+            self.session_ua = user_agent
             set_weights(self.settings.get("score_weights"))
             self.q: queue.Queue = queue.Queue()
             self.cancel_event: threading.Event | None = None
@@ -3085,6 +3228,16 @@ def run_gui() -> None:
             apply(self.T)
             self._theme_listeners.append(apply)
 
+        def switch_user(self):
+            if self.worker is not None and self.worker.is_alive():
+                messagebox.showinfo(APP_NAME, "Wait for the scan to finish (or cancel it) before switching user.",
+                                    parent=self.root)
+                return
+            ua = ask_sec_identity(self.root, self.theme_name, parent=self.root)
+            if ua:
+                self.ua_var.set(ua)
+                self.session_ua = ua
+
         def _menu(self):
             m = tk.Menu(self.root)
             fm = tk.Menu(m, tearoff=0)
@@ -3093,6 +3246,8 @@ def run_gui() -> None:
             fm.add_separator()
             fm.add_command(label="Signal Track Record...", command=self.show_track_record, accelerator="Ctrl+T")
             fm.add_command(label="Back-test Signal Score...", command=self.show_backtest, accelerator="Ctrl+B")
+            fm.add_separator()
+            fm.add_command(label="Switch user (name and email)...", command=self.switch_user)
             fm.add_separator()
             fm.add_command(label="Open Data Folder", command=self.open_data_folder)
             fm.add_command(label="Clear Download Cache", command=self.clear_cache)
@@ -3324,11 +3479,12 @@ def run_gui() -> None:
             # SEC contact ---------------------------------------------------
             f = ttk.Frame(self.settings_frame)
             f.pack(fill="x", pady=(6, 2))
-            ttk.Label(f, text="SEC contact (User-Agent):").pack(side="left")
-            self.ua_var = tk.StringVar(value=st.get("user_agent", ""))
-            ttk.Entry(f, textvariable=self.ua_var, width=42).pack(side="left", padx=6)
-            ttk.Label(f, text="SEC requires your name + email on automated requests, e.g. \"Jane Doe jane@example.com\"",
-                      style="Hint.TLabel").pack(side="left")
+            ttk.Label(f, text="Signed in as (sent to the SEC):").pack(side="left")
+            self.ua_var = tk.StringVar(value=self.session_ua)
+            ttk.Label(f, textvariable=self.ua_var, font=self.bold_font).pack(side="left", padx=6)
+            ttk.Button(f, text="Switch user...", command=self.switch_user).pack(side="left", padx=6)
+            ttk.Label(f, text="Not saved: everyone enters their own name and email each time the app opens.",
+                      style="Hint.TLabel").pack(side="left", padx=(6, 0))
 
             # Action row -----------------------------------------------------
             f = ttk.Frame(outer)
@@ -3573,8 +3729,8 @@ def run_gui() -> None:
         def _collect_params(self) -> ScanParams | None:
             ua = self.ua_var.get().strip()
             if not valid_user_agent(ua):
-                messagebox.showwarning(APP_NAME, "SEC requires a contact on automated requests.\n\n"
-                                       "Enter your name and email in 'SEC contact', e.g.\n    Jane Doe jane@example.com")
+                messagebox.showwarning(APP_NAME, "The SEC requires your name and email on automated requests.\n\n"
+                                       "Use File > Switch user to sign in.")
                 return None
             try:
                 start = dt.date.fromisoformat(self.from_var.get().strip())
@@ -3612,7 +3768,7 @@ def run_gui() -> None:
                 "roles": [r for r, v in self.role_vars.items() if v.get()],
                 "codes": [c for c, v in self.code_vars.items() if v.get()],
                 "min_value": self.min_var.get(), "amendments": self.amend_var.get(),
-                "combine": self.combine_var.get(), "user_agent": self.ua_var.get().strip(),
+                "combine": self.combine_var.get(),
                 "exclude_plan": self.excl_plan_var.get(), "clusters_only": self.cluster_only_var.get(),
                 "cluster_min": self._cluster_min(), "min_stake": self.min_stake_var.get(),
                 "check_history": self.history_var.get(), "hide_routine": self.hide_routine_var.get(),
@@ -4504,7 +4660,7 @@ def run_gui() -> None:
         def run(self):
             ua = self.app.ua_var.get().strip()
             if not valid_user_agent(ua):
-                messagebox.showwarning(APP_NAME, "Enter your name and email in 'SEC contact' in the main window first.",
+                messagebox.showwarning(APP_NAME, "Sign in with your name and email first (File > Switch user).",
                                        parent=self.win)
                 return
             a, b = self.start_var.get().lower(), self.end_var.get().lower()
@@ -4844,7 +5000,13 @@ def run_gui() -> None:
                 self.summary.set("History cleared.")
 
     root = tk.Tk()
-    App(root)
+    root.withdraw()
+    ua = ask_sec_identity(root, load_settings().get("theme", "Light"))
+    if not ua:
+        root.destroy()
+        return
+    App(root, ua)
+    root.deiconify()
     root.mainloop()
 
 
