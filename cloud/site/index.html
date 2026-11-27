@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Insider Scanner</title>
+<meta name="description" content="Tonight's strongest insider buys and sell warnings from SEC Form 4 filings.">
+<meta name="theme-color" content="#1e3a5f">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Insiders">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<style>
+  :root {
+    --page: #f3f5f8; --panel: #ffffff; --ink: #1f2933; --muted: #5f6b78; --rule: #dde3ea;
+    --navy: #1e3a5f; --navy-ink: #ffffff; --navy-muted: #b9c8dc; --link: #2563eb;
+    --buy: #15803d; --buy-soft: #e8f6ec; --sell: #b91c1c; --sell-soft: #fbeaea; --chip: #eef2f7;
+    --tabular: tabular-nums;
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    --page: #15171c; --panel: #1c2027; --ink: #e5e7eb; --muted: #9aa3af; --rule: #2c323c;
+    --navy: #0f1d30; --navy-ink: #f3f4f6; --navy-muted: #8fa3bd; --link: #60a5fa;
+    --buy: #4ade80; --buy-soft: #16301f; --sell: #f87171; --sell-soft: #371b1e; --chip: #262c35;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --page: #15171c; --panel: #1c2027; --ink: #e5e7eb; --muted: #9aa3af; --rule: #2c323c;
+      --navy: #0f1d30; --navy-ink: #f3f4f6; --navy-muted: #8fa3bd; --link: #60a5fa;
+      --buy: #4ade80; --buy-soft: #16301f; --sell: #f87171; --sell-soft: #371b1e; --chip: #262c35;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: var(--page); color: var(--ink);
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-variant-numeric: var(--tabular);
+  }
+  button, input { font: inherit; color: inherit; }
+  a { color: var(--link); }
+  :focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+
+  header.top {
+    background: var(--navy); color: var(--navy-ink);
+    padding: calc(14px + env(safe-area-inset-top)) 18px 14px;
+    display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; align-items: start;
+  }
+  header.top h1 { margin: 0; font-size: 1.35rem; font-weight: 750; letter-spacing: -0.01em; }
+  header.top p { margin: 0; grid-column: 1; color: var(--navy-muted); font-size: 0.86rem; }
+  #themeBtn {
+    grid-row: 1 / span 2; grid-column: 2; align-self: center;
+    background: transparent; border: 1px solid color-mix(in srgb, var(--navy-ink) 35%, transparent);
+    color: var(--navy-ink); border-radius: 999px; padding: 6px 12px; font-size: 0.85rem; cursor: pointer;
+  }
+
+  nav.tabs {
+    position: sticky; top: 0; z-index: 5; background: var(--page);
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    border-bottom: 1px solid var(--rule);
+  }
+  nav.tabs button {
+    border: 0; background: none; padding: 12px 4px 10px; font-size: 0.92rem; font-weight: 600;
+    color: var(--muted); border-bottom: 3px solid transparent; cursor: pointer;
+  }
+  nav.tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--link); }
+  nav.tabs .n { font-weight: 500; color: var(--muted); }
+
+  .search { padding: 10px 14px 4px; }
+  .search input {
+    width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--rule);
+    background: var(--panel); font-size: 1rem;
+  }
+  main { max-width: 760px; margin: 0 auto; padding-bottom: calc(28px + env(safe-area-inset-bottom)); }
+  .intro { margin: 10px 16px 6px; color: var(--muted); font-size: 0.88rem; max-width: 62ch; }
+  h2.section { margin: 22px 16px 6px; font-size: 1.05rem; }
+
+  ul.list { list-style: none; margin: 0; padding: 0; background: var(--panel);
+            border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+  ul.list > li + li { border-top: 1px solid var(--rule); }
+
+  .trade { display: grid; grid-template-columns: 3.9rem 1fr auto; gap: 0 12px; width: 100%;
+           text-align: left; background: none; border: 0; padding: 12px 16px; cursor: pointer; }
+  .score { grid-row: 1 / span 3; font-size: 2.1rem; font-weight: 800; line-height: 1; letter-spacing: -0.03em;
+           padding-top: 2px; }
+  .score small { display: block; font-size: 0.68rem; font-weight: 600; letter-spacing: 0; color: var(--muted);
+                 margin-top: 4px; }
+  .P .score { color: var(--buy); }
+  .S .score { color: var(--sell); }
+  .line1 { display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+  .ticker { font-weight: 750; }
+  .company { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .value { font-weight: 700; text-align: right; }
+  .S .value { color: var(--sell); }
+  .P .value { color: var(--buy); }
+  .who { grid-column: 2; font-size: 0.93rem; }
+  .what { grid-column: 2 / span 2; font-size: 0.88rem; color: var(--muted); }
+  .date { grid-column: 3; grid-row: 2; text-align: right; font-size: 0.82rem; color: var(--muted); }
+
+  .detail { padding: 2px 16px 16px calc(3.9rem + 28px); font-size: 0.9rem; }
+  .why { margin: 4px 0 12px; padding: 0; list-style: none; }
+  .why li { display: grid; grid-template-columns: 2.6rem 1fr; }
+  .why .pts { font-weight: 700; text-align: right; padding-right: 10px; }
+  .why .pos { color: var(--buy); }
+  .why .neg { color: var(--sell); }
+  .S .why .pos { color: var(--sell); }
+  .S .why .neg { color: var(--buy); }
+  dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; margin: 0 0 12px; }
+  dl.facts dt { color: var(--muted); }
+  dl.facts dd { margin: 0; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+  .chip { background: var(--chip); border-radius: 6px; padding: 2px 8px; font-size: 0.8rem; }
+  a.filing { display: inline-block; padding: 9px 14px; border-radius: 9px; background: var(--link);
+             color: #fff; text-decoration: none; font-weight: 650; font-size: 0.9rem; }
+
+  .group { padding: 14px 16px 4px; }
+  .group h3 { margin: 0; font-size: 1.02rem; display: flex; gap: 8px; align-items: baseline; }
+  .group h3 .company { font-weight: 500; }
+  .group p { margin: 2px 0 0; color: var(--muted); font-size: 0.88rem; }
+  .group + ul.list { border-top: 0; }
+  .group-wrap { background: var(--panel); border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule);
+                margin-bottom: 12px; }
+  .group-wrap ul.list { border: 0; }
+  .group-wrap ul.list > li { border-top: 1px solid var(--rule); }
+
+  .leader { display: grid; grid-template-columns: 1.8rem 1fr auto; gap: 0 10px; width: 100%; text-align: left;
+            background: none; border: 0; padding: 12px 16px; cursor: pointer; }
+  .rank { color: var(--muted); font-weight: 700; padding-top: 1px; }
+  .leader .name { font-weight: 650; }
+  .leader .sub { grid-column: 2 / span 2; color: var(--muted); font-size: 0.86rem; }
+  .leader .total { font-weight: 750; }
+  .buyers .total { color: var(--buy); }
+  .sellers .total { color: var(--sell); }
+  .leader-trades { background: var(--page); }
+
+  .empty, .error { margin: 28px 18px; color: var(--muted); max-width: 60ch; }
+  .error { color: var(--sell); }
+  footer { margin: 26px 18px 0; color: var(--muted); font-size: 0.82rem; max-width: 62ch; }
+  footer p { margin: 0 0 8px; }
+  [hidden] { display: none !important; }
+  @media (min-width: 700px) { main { padding-top: 8px; } ul.list, .group-wrap { border-radius: 12px; border: 1px solid var(--rule); margin: 0 12px 12px; overflow: hidden; } }
+</style>
+</head>
+<body>
+<header class="top">
+  <h1>Insider Scanner</h1>
+  <p id="updated">Loading tonight's scan…</p>
+  <button id="themeBtn" type="button" aria-label="Change color theme">Auto</button>
+</header>
+<nav class="tabs" role="tablist">
+  <button role="tab" data-tab="buys" aria-selected="true">Buys <span class="n" id="nBuys"></span></button>
+  <button role="tab" data-tab="sells" aria-selected="false">Sells <span class="n" id="nSells"></span></button>
+  <button role="tab" data-tab="clusters" aria-selected="false">Clusters</button>
+  <button role="tab" data-tab="week" aria-selected="false">This week</button>
+</nav>
+<main>
+  <div class="search"><input id="q" type="search" placeholder="Search ticker, company or insider" autocomplete="off" aria-label="Search"></div>
+  <div id="view"></div>
+  <footer>
+    <p>Buys and Sells use the same filters and scores as the desktop app's Insider Buying and Insider Selling presets, over the last 30 days. Tap a trade to see why it scored that way.</p>
+    <p>Scores are a starting point for research, not investment advice. Data from SEC EDGAR; prices from Yahoo Finance.</p>
+    <p><a href="https://github.com/chadant1/form4-insider-scanner/releases/latest">Get the desktop app</a> for custom scans and back-tests.</p>
+  </footer>
+</main>
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const state = { data: null, byId: new Map(), tab: "buys", q: "" };
+
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === "class") el.className = v;
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const kid of kids.flat(Infinity)) if (kid !== null && kid !== undefined && kid !== "") el.append(kid);
+  return el;
+}
+
+const money = (v) => {
+  const a = Math.abs(v);
+  if (a >= 1e9) return "$" + (v / 1e9).toFixed(1) + "B";
+  if (a >= 1e6) return "$" + (v / 1e6).toFixed(1) + "M";
+  if (a >= 1e3) return "$" + Math.round(v / 1e3) + "K";
+  return "$" + Math.round(v);
+};
+const full$ = (v) => "$" + Math.round(v).toLocaleString("en-US");
+const price = (v) => v === null ? "" : "$" + v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const pct = (v, plus = true) => v === null || v === undefined ? "" : (plus && v > 0 ? "+" : "") + v + "%";
+const shortDate = (iso) => iso ? new Date(iso + "T12:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "";
+
+function whatLine(r) {
+  const n = r.shares.toLocaleString("en-US");
+  if (r.code === "P") {
+    const parts = [`Bought ${n} shares at ${price(r.price)}`];
+    if (r.stake_new) parts.push("a new position");
+    else if (r.stake !== null) parts.push(`stake up ${r.stake}%`);
+    if (r.cluster > 1) parts.push(`${r.cluster} insiders buying`);
+    return parts.join(", ");
+  }
+  const parts = [`Sold ${n} shares at ${price(r.price)}`];
+  if (r.stake !== null) parts.push(r.stake <= -99.5 ? "the entire holding" : `${Math.abs(r.stake)}% of the holding`);
+  if (r.cluster > 1) parts.push(`${r.cluster} insiders selling`);
+  return parts.join(", ");
+}
+
+function detail(r) {
+  const why = h("ul", { class: "why" }, r.why.map((w) => {
+    const m = String(w).match(/^\s*([+-]\d+)\s+(.*)$/);
+    const pts = m ? m[1] : "";
+    return h("li", {}, h("span", { class: "pts " + (pts.startsWith("-") ? "neg" : "pos") }, pts), h("span", {}, m ? m[2] : w));
+  }));
+  const facts = [
+    ["Title", r.title], ["Trade date", shortDate(r.traded)], ["Filed", shortDate(r.filed)],
+    ["Total", full$(r.value)], ["History", r.pattern], ["Sold since", r.sold],
+    ["Market cap", r.mcap], ["Of the company", r.pct_co === null ? "" : r.pct_co + "%"],
+    ["Off 52-week high", r.off_high === null ? "" : r.off_high + "%"], ["3-month move", pct(r.chg3m)],
+    ["Since the trade", pct(r.since)], ["Insiders, 90 days", r.net90],
+  ].filter(([, v]) => v);
+  return h("div", { class: "detail" },
+    r.why.length ? why : null,
+    h("dl", { class: "facts" }, facts.map(([k, v]) => [h("dt", {}, k), h("dd", {}, v)])),
+    r.flags.length ? h("div", { class: "chips" }, r.flags.map((f) => h("span", { class: "chip" }, f))) : null,
+    r.link ? h("a", { class: "filing", href: r.link, target: "_blank", rel: "noopener" }, "Open SEC filing") : null);
+}
+
+function tradeItem(r) {
+  const li = h("li", { class: r.code });
+  let open = null;
+  const btn = h("button", { class: "trade", type: "button", "aria-expanded": "false",
+    onclick: () => {
+      if (open) { open.remove(); open = null; btn.setAttribute("aria-expanded", "false"); return; }
+      open = detail(r); li.append(open); btn.setAttribute("aria-expanded", "true");
+    } },
+    h("span", { class: "score" }, r.score === null ? "–" : String(r.score), h("small", {}, r.code === "P" ? "buy" : "sell")),
+    h("span", { class: "line1" }, h("span", { class: "ticker" }, r.ticker || "—"), h("span", { class: "company" }, r.company)),
+    h("span", { class: "value" }, money(r.value)),
+    h("span", { class: "who" }, r.insider + (r.role ? ", " + r.role : "")),
+    h("span", { class: "date" }, shortDate(r.filed)),
+    h("span", { class: "what" }, whatLine(r)));
+  li.append(btn);
+  return li;
+}
+
+function matches(r) {
+  if (!state.q) return true;
+  return `${r.ticker} ${r.company} ${r.insider} ${r.title}`.toLowerCase().includes(state.q);
+}
+const rowsFor = (ids) => ids.map((id) => state.byId.get(id)).filter(Boolean).filter(matches);
+
+function empty(text) { return h("p", { class: "empty" }, text); }
+
+function renderList(ids, intro, emptyText) {
+  const rows = rowsFor(ids);
+  if (!rows.length) return [h("p", { class: "intro" }, intro), empty(state.q ? "Nothing matches your search." : emptyText)];
+  return [h("p", { class: "intro" }, intro), h("ul", { class: "list" }, rows.map(tradeItem))];
+}
+
+function renderClusters() {
+  const groups = new Map();
+  for (const r of rowsFor(state.data.buys)) {
+    const k = r.ticker || r.company;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(r);
+  }
+  const list = [...groups.values()].sort((a, b) => Math.max(...b.map((r) => r.score || 0)) - Math.max(...a.map((r) => r.score || 0)));
+  const intro = h("p", { class: "intro" }, "Companies where two or more insiders bought on the open market in the last 30 days, strongest first.");
+  if (!list.length) return [intro, empty(state.q ? "Nothing matches your search." : "No cluster buys passed the filters in the last 30 days.")];
+  return [intro, ...list.map((rows) => {
+    const total = rows.reduce((s, r) => s + r.value, 0);
+    const n = Math.max(rows[0].cluster, rows.length);
+    return h("section", { class: "group-wrap" },
+      h("div", { class: "group" },
+        h("h3", {}, h("span", {}, rows[0].ticker), h("span", { class: "company" }, rows[0].company)),
+        h("p", {}, `${n} insiders buying, ${money(total)} shown here`)),
+      h("ul", { class: "list" }, rows.map(tradeItem)));
+  })];
+}
+
+function leaderList(leaders, cls) {
+  const filtered = leaders.filter((g) => !state.q || `${g.insider} ${g.tickers.join(" ")}`.toLowerCase().includes(state.q)
+    || g.ids.some((id) => { const r = state.byId.get(id); return r && matches(r); }));
+  if (!filtered.length) return empty(state.q ? "Nothing matches your search." : "None this week.");
+  return h("ul", { class: "list " + cls }, filtered.map((g, i) => {
+    const li = h("li");
+    let open = null;
+    const btn = h("button", { class: "leader", type: "button", "aria-expanded": "false", onclick: () => {
+      if (open) { open.remove(); open = null; btn.setAttribute("aria-expanded", "false"); return; }
+      open = h("ul", { class: "list leader-trades" }, g.ids.map((id) => state.byId.get(id)).filter(Boolean).map(tradeItem));
+      li.append(open); btn.setAttribute("aria-expanded", "true");
+    } },
+      h("span", { class: "rank" }, String(i + 1)),
+      h("span", { class: "name" }, g.insider),
+      h("span", { class: "total" }, money(g.total)),
+      h("span", { class: "sub" }, [g.role, g.tickers.slice(0, 4).join(", "),
+        g.trades === 1 ? "1 trade" : `${g.trades} trades`].filter(Boolean).join("; ")));
+    li.append(btn);
+    return li;
+  }));
+}
+
+function renderWeek() {
+  const d = state.data;
+  return [
+    h("p", { class: "intro" }, `The insiders who bought or sold the most from ${shortDate(d.week_start)} to ${shortDate(d.end)}, excluding pre-planned 10b5-1 trades, offerings and fund sales. Tap a name to see their trades.`),
+    h("h2", { class: "section" }, "Biggest buyers"), leaderList(d.week_buyers, "buyers"),
+    h("h2", { class: "section" }, "Biggest sellers"), leaderList(d.week_sellers, "sellers"),
+  ];
+}
+
+function render() {
+  const v = $("#view");
+  v.replaceChildren();
+  if (!state.data) return;
+  const d = state.data;
+  let parts;
+  if (state.tab === "buys") parts = renderList(d.buys,
+    "Open-market buys of $100K or more where two or more insiders bought, each grew their stake 10% or more, and nobody was on a 10b5-1 plan or a routine buyer. Highest Signal Score first.",
+    "No buys passed the Insider Buying filters in the last 30 days.");
+  else if (state.tab === "sells") parts = renderList(d.sells,
+    "Sales of $250K or more where the insider sold 25% or more of their holding, with no 10b5-1 plan, no explanation in the filing and no routine selling. Strongest warning first.",
+    "No sales passed the Insider Selling filters in the last 30 days.");
+  else if (state.tab === "clusters") parts = renderClusters();
+  else parts = renderWeek();
+  v.append(...parts);
+}
+
+function selectTab(tab) {
+  state.tab = tab;
+  for (const b of document.querySelectorAll("nav.tabs button")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
+  try { sessionStorage.setItem("tab", tab); } catch (e) {}
+  render();
+}
+
+// Theme: Auto follows the phone; Light and Dark override it.
+const THEMES = ["auto", "light", "dark"];
+function applyTheme(t) {
+  if (t === "auto") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", t);
+  $("#themeBtn").textContent = t[0].toUpperCase() + t.slice(1);
+  const dark = t === "dark" || (t === "auto" && matchMedia("(prefers-color-scheme: dark)").matches);
+  document.querySelector('meta[name="theme-color"]').setAttribute("content", dark ? "#0f1d30" : "#1e3a5f");
+}
+let theme = "auto";
+try { theme = localStorage.getItem("theme") || "auto"; } catch (e) {}
+applyTheme(theme);
+$("#themeBtn").addEventListener("click", () => {
+  theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+  try { localStorage.setItem("theme", theme); } catch (e) {}
+  applyTheme(theme);
+});
+
+for (const b of document.querySelectorAll("nav.tabs button")) b.addEventListener("click", () => selectTab(b.dataset.tab));
+$("#q").addEventListener("input", (e) => { state.q = e.target.value.trim().toLowerCase(); render(); });
+
+async function load() {
+  try {
+    const res = await fetch("data.json", { cache: "no-cache" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const d = await res.json();
+    state.data = d;
+    state.byId = new Map(d.rows.map((r) => [r.id, r]));
+    $("#updated").textContent = `Updated ${d.generated_local}. ${d.filings_scanned.toLocaleString("en-US")} filings, ${shortDate(d.start)} to ${shortDate(d.end)}.`;
+    $("#nBuys").textContent = d.buys.length;
+    $("#nSells").textContent = d.sells.length;
+    let tab = "buys";
+    try { tab = sessionStorage.getItem("tab") || "buys"; } catch (e) {}
+    selectTab(tab);
+  } catch (e) {
+    $("#updated").textContent = "Tonight's scan isn't available.";
+    $("#view").replaceChildren(h("p", { class: "error" },
+      "The results couldn't be loaded. Check your connection and reopen the page. If this keeps happening, the nightly scan may have failed; see the Actions tab on GitHub."));
+  }
+}
+load();
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && state.data) {
+  const age = Date.now() - Date.parse(state.data.generated_utc);
+  if (age > 6 * 3600e3) load();
+} });
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+</script>
+</body>
+</html>
