@@ -1,0 +1,63 @@
+name: Nightly insider scan
+
+# Scans SEC Form 4 filings every weekday evening and publishes the phone page to GitHub Pages.
+on:
+  schedule:
+    - cron: "43 3 * * 2-6"   # 9:43 PM Central (10:43 PM in summer), Monday to Friday
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: nightly-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      LOCALAPPDATA: ${{ github.workspace }}/.scan-data
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Restore download cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .scan-data
+          key: scan-data-${{ github.run_id }}
+          restore-keys: scan-data-
+
+      - name: Scan SEC filings and build the page
+        env:
+          SEC_CONTACT: ${{ secrets.SEC_CONTACT }}
+        run: python cloud/publish_site.py --out _site
+
+      - name: Save download cache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: .scan-data
+          key: scan-data-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+  deploy:
+    needs: scan
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
